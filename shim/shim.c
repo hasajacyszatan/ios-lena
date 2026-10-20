@@ -16,8 +16,8 @@
 #define RESTART_BOOTLOADER	0x77665500U
 #define PSHOLD			0x0440b000UL
 
-#define GICD_BASE		0x0f200000UL
-#define GICR_BASE		0x0f300000UL
+#define GICD_BASE		0x17a00000UL
+#define GICR_BASE		0x17a60000UL
 #define GICR_SIZE		0x100000UL
 #define GICR_PE_SIZE		0x20000UL
 #define GICR_TYPER		0x08
@@ -59,8 +59,8 @@ static inline void wr8(uintptr_t a, uint8_t v) { *(volatile uint8_t *)a = v; }
 extern char secondary_entry[];
 
 static const char *stage;	/* set at runtime: no absolute pointers in data */
-/* topaz: CPU0-3 (A53) at MPIDR 0x0-0x3, CPU4-7 (A73) at 0x100-0x103 */
-static inline uint64_t cpu_mpidr(int i) { return (uint64_t)(i >> 2) << 8 | (i & 3); }
+/* sm6350 / sweet: CPU0-5 (A55) at MPIDR 0x000-0x500, CPU6-7 (A77) at 0x600-0x700 */
+static inline uint64_t cpu_mpidr(int i) { return (uint64_t)i << 8; }
 
 static volatile uint64_t sec_mpidr[NR_CPUS];
 static volatile uint64_t sec_probe[4];	/* CPU1 redistributor write test */
@@ -508,24 +508,12 @@ void shim_main(uint64_t dtb)
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
 	con_clear(RED);
-	con_str("SHIM", "sweet milestone 4: xnu loader");
-	/* topaz: xnu needs the 16K granule (TGran16 != 0); Cortex-A53 may lack it */
+	con_str("SHIM", "lena milestone 4: xnu loader (SM6350 pdx213)");
 	uint64_t mmfr0 = rsr("id_aa64mmfr0_el1");
 	con_hex2("MMFR0", "lo=", (uint32_t)mmfr0, "tg16=", (mmfr0 >> 20) & 0xf);
 	con_hex2("MIDR", "el1=", (uint32_t)rsr("midr_el1"), "mpidr=", (uint32_t)rsr("mpidr_el1"));
 	if (((mmfr0 >> 20) & 0xf) == 0) {
-		con_str("SILVER", "no 16K granule: handing off to gold CPU 0x100");
-		con_skip();
-		silver_ticks = speed_ticks();
-		gold_dtb = dtb;
-		__asm__ volatile("dsb sy" ::: "memory");
-		int64_t r = smc(PSCI_CPU_ON, 0x100, (uintptr_t)secondary_entry, 4);
-		if (r == 0) {
-			for (;;)	/* parked with DAIF masked (start.S) */
-				__asm__ volatile("wfi");
-		}
-		gold_dtb = 0;
-		con_hex("CPU_ON", (uint64_t)r);
+		con_str("WARNING", "no 16K granule reported by CPU!");
 	}
 	con_skip();
 	const char *why = loader_boot(dtb);

@@ -1,0 +1,43 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b926fe..40044c8 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -656,10 +656,21 @@ sweet_ufs_init(void)
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
+ 	sweet_sample_start();
+-	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+-	sweet_keys_init();
+-	sweet_touch_init();
+-	sweet_usb_probe();
++	/*
++	 * Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp).
++	 * They still poke SM7150 MMIO (SPMI, GENI SE7, DWC3 at 0xa600000); on
++	 * lena/topaz that faults or hangs, so they only run with sweethw=1 until
++	 * ported.
++	 */
++	int hw = 0;
++	(void)PE_parse_boot_argn("sweethw", &hw, sizeof(hw));
++	if (hw == 1) {
++		sweet_keys_init();
++		sweet_touch_init();
++		sweet_usb_probe();
++	} else {
++		printf("SWEET UFS: keys/touch/USB skipped (lena, sweethw=0)\n");
++	}
+ 	return 0;
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 2545cf9..1724396 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -82,7 +82,7 @@ SweetCPU::start(IOService *provider)
+ 	if (!IOCPU::start(provider)) {
+ 		return false;
+ 	}
+-	cpuName = OSSymbol::withCStringNoCopy("Kryo 470");
++	cpuName = OSSymbol::withCStringNoCopy("Kryo 560");
+ 	if (cpuName == NULL) {
+ 		return false;
+ 	}

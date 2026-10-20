@@ -16,32 +16,27 @@ MEM_SIZE = 0x4d000000
 # node is <0x40000000 0x3bb00000>, <0x80000000 3G>, <0x1_40000000 4G>; every
 # fixed reserved-memory carve-out is below 0x63900000 and the dynamic pools are
 # limited below 4G.
-HIGH_PHYS_BASE = 0x140000000
+HIGH_PHYS_BASE = 0x100000000
 HIGH_MEM_SIZE = 0x100000000
-# --midmem (phone only): the middle and upper banks as one range, 0x80000000 +
-# 3G + 4G = 7G up to 0x2_40000000. No fixed carve-out is above 0x63900000, and it
-# gives the kernel RAM below 4 GiB, which the GPU needs (it does not reach above).
-MID_PHYS_BASE = int(__import__("os").environ.get("MIDBASE", "0x80000000"), 16)
-MID_MEM_SIZE = int(__import__("os").environ.get("MIDSIZE", "0x1c0000000"), 16)
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
-# interrupt-controller@f200000 (redistributor-stride 0x20000, 8 cores)
-GICD, GICD_SIZE = 0x0f200000, 0x10000
-GICR, GICR_SIZE = 0x0f300000, 0x100000
-# cont_splash_region left lit by ABL
-FB, FB_SIZE = 0x5c000000, 0xf00000
-SWEET_ECID = 0x544f50415a000001  # 'TOPAZ' + 1, synthetic
-FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
-# Internal UFS host (ufshc@4804000 "ufs_mem"); QEMU virt has none
-UFS, UFS_SIZE = 0x04804000, 0x3000
+# interrupt-controller@17a00000 (redistributor-stride 0x20000, 8 cores)
+GICD, GICD_SIZE = 0x17a00000, 0x10000
+GICR, GICR_SIZE = 0x17a60000, 0x100000
+# cont_splash_memory left lit by ABL on Sony Xperia 10 III (pdx213 / lena)
+FB, FB_SIZE = 0xa0000000, 0x2300000
+SWEET_ECID = 0x534f4e594c454e41  # 'SONYLENA', synthetic
+FB_W, FB_H, FB_STRIDE = 1080, 2520, 1080 * 4
+# Internal UFS host (ufshc@1d84000 "ufs_mem")
+UFS, UFS_SIZE = 0x01d84000, 0x3000
 TIMEBASE = 19200000
 VTIMER_INTID = 19
 # QEMU virt (-M virt,gic-version=3 -cpu cortex-a76): GICD/GICR and the generic timer's CNTFRQ
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
 
-BOOT_MANIFEST_HASH = hashlib.sha384(b'topaz boot manifest').digest()
+BOOT_MANIFEST_HASH = hashlib.sha384(b'lena boot manifest').digest()
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
 # derives product type, device class, home-button-less UI, artwork etc. from
@@ -128,28 +123,25 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
-    # TOPAZ SMP: only the four Cortex-A73 (gold) cores, MPIDR 0x100-0x103:
-    # the Kryo 260 Silver cores have no 16K granule, so the shim boots xnu
-    # on gold CPU 0x100 and parks the silver cluster. One cluster. The kernel defaults to one
-    # and uses cpus=N to select an initial prefix (N <= 8).
-    # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
+    # LENA SMP (SM6350): 6x Cortex-A55 (MPIDR 0x000-0x500) + 2x Cortex-A77 (MPIDR 0x600-0x700).
+    # All 8 cores support 16K translation granule and ARMv8.2-A.
     cpu_nodes = []
-    for core in range(1 if qemu else 4):
+    for core in range(1 if qemu else 8):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('qcom,kryo260') + cstr('qcom,kryo470') + cstr('ARM,v8')),
-            ('reg', u32(core if qemu else 0x100 | core)),  # actual MPIDR Aff1:Aff0, NOT logical ID
+            ('compatible', cstr('qcom,kryo560') + cstr('qcom,kryo470') + cstr('ARM,v8')),
+            ('reg', u32(core if qemu else (core << 8))),  # actual MPIDR Aff1:Aff0
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
-            ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
+            ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP
             ('die-cluster-id', u32(0)),
             ('cluster-core-id', u32(core)),
-            ('l2-cache-id', u32(0)),  # gold L2
+            ('l2-cache-id', u32(core)),
             ('l3-cache-id', u32(0)),
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(2803200000)),
+            ('clock-frequency', u32(2000000000 if core >= 6 else 1700000000)),
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(1866000000)),
             ('peripheral-frequency', u32(timebase)),
@@ -196,7 +188,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
             # which must match the canvas: sweetfb_native=1 with a 1125x2436 canvas makes
             # backboardd ask for a hardware scaler that does not exist)
             ('canvas-width', u32(1080 if native else 1125)),
-            ('canvas-height', u32(2400 if native else 2436)),
+            ('canvas-height', u32(2520 if native else 2436)),
         ])])
 
     fbcon = node('sweet-fbcon', [
@@ -243,7 +235,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     # SweetPlatformExpert and CPU IONameMatch still use them.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,topaz') + cstr('xiaomi,sweet') + cstr('qcom,khaje') + cstr('AppleARM')),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('sony,lena') + cstr('sony,pdx213') + cstr('qcom,sm6350') + cstr('xiaomi,topaz') + cstr('xiaomi,sweet') + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
