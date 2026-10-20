@@ -7,16 +7,16 @@
 set -eu
 cd "$(dirname "$0")/.."
 name=${1:?usage: kbuild.sh NAME [LABEL="boot-args"]...}; shift
-repo=MakrSas/ios-topaz
-base="debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=60"
+repo=${REPO:-hasajacyszatan/ios-lena}
+ref=${REF:-lena}
+base="debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=60"
 head=$(git rev-parse HEAD)
-[ "$(git rev-parse origin/topaz)" = "$head" ] || { echo "push topaz first" >&2; exit 1; }
 
-for r in $(gh run list -R $repo -w xnu.yml -L 20 --json databaseId,status -q ".[]|select(.status!=\"completed\")|.databaseId"); do
+for r in $(gh run list -R $repo -w xnu.yml -L 20 --json databaseId,status -q ".[]|select(.status!=\"completed\")|.databaseId" 2>/dev/null || true); do
   gh run cancel -R $repo "$r" >/dev/null 2>&1 || true
 done
 t0=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-gh workflow run xnu.yml -R $repo --ref topaz
+gh workflow run xnu.yml -R $repo --ref $ref
 run=""
 for i in $(seq 30); do
   sleep 4
