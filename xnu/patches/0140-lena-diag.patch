@@ -1,0 +1,205 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lena <lena@x>
+Date: Sun, 25 Oct 2026 00:55:00 +0200
+Subject: [PATCH] lena-0140: diag console counters, bsd_init trace and heartbeat, sweetfb gate
+
+---
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bb2a2bf..4644d64 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -459,6 +459,49 @@ bsd_rooted_ramdisk(void)
+ 	return is_ramdisk;
+ }
+ 
++/*
++ * lena diag: a thread that keeps printing while the bootstrap thread may be
++ * blocked (e.g. waiting for IOKit to quiesce). If the console stops changing
++ * with heartbeats still coming, the kernel is alive and something is waiting;
++ * if the heartbeats stop too, the SoC itself hung on an MMIO access.
++ * Enabled with the boot-arg sweetdiag=1.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++static volatile int sweet_diag_stage;   /* 0 = inside bsd_init, 2 = init started */
++
++static void
++sweet_diag_heartbeat(void *arg, wait_result_t wr)
++{
++	unsigned int secs = 0;
++
++	(void)arg;
++	(void)wr;
++	while (sweet_diag_stage < 2 && secs < 600) {
++		IOSleep(10000);
++		secs += 10;
++		if (sweet_diag_stage >= 2) {
++			break;
++		}
++		printf("SWEET HB: alive %u s (bsd_init)\n", secs);
++	}
++}
++
++static void
++sweet_diag_start(void)
++{
++	thread_t thread;
++	int on = 0;
++
++	if (!PE_parse_boot_argn("sweetdiag", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	printf("SWEET DIAG: heartbeat thread every 10 s\n");
++	if (kernel_thread_start(sweet_diag_heartbeat, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ /*
+  * This function is called very early on in the Mach startup, from the
+  * function start_kernel_threads() in osfmk/kern/startup.c.  It's called
+@@ -490,7 +533,13 @@ bsd_init(void)
+ 	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
+ #endif
+ 
+-#define DEBUG_BSDINIT 0
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_diag_start();
++#endif
++
++	printf("SWEET BSD: bsd_init entered\n");
++
++#define DEBUG_BSDINIT 1
+ 
+ #if DEBUG_BSDINIT
+ #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
+@@ -903,6 +952,8 @@ bsd_init(void)
+ 
+ 	mountlist.tqh_first->mnt_flag |= MNT_ROOTFS;
+ 
++	printf("SWEET BSD: root mounted: %s\n", rootdevice);
++
+ 	bsd_init_kprintf("calling VFS_ROOT\n");
+ 	/* Get the vnode for '/'.  Set fdp->fd_fd.fd_cdir to reference it. */
+ 	if (VFS_ROOT(mountlist.tqh_first, &init_rootvnode, vfs_context_kernel())) {
+@@ -1098,6 +1149,10 @@ bsdinit_task(void)
+ 
+ 	bsd_init_kprintf("bsd_do_post - done");
+ 
++	printf("SWEET BSD: starting init (%s)\n", "/sbin/launchd");
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_diag_stage = 2;
++#endif
+ 	load_init_program(p);
+ 	lock_trace = 1;
+ }
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6f29fba..e80b2bc 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -263,10 +263,24 @@ bool
+ AppleCLCD::start(IOService *provider)
+ {
+ 	PE_Video video;
++	uint32_t hwEnable = 1;
+ 
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
++	/*
++	 * lena: the display driver below still programs topaz registers
++	 * (MDP 0x5e0xxxx, DSI 0x5e94000). On SM6350 those addresses belong to
++	 * nothing (MDP is 0xae00000, DSI0 0xae94000) and touching them hangs the
++	 * matching thread, which in turn blocks bsd_init waiting for IOKit to
++	 * quiesce. Keep everything below the gate until the driver is ported;
++	 * the prompt console keeps running on the ABL framebuffer.
++	 */
++	(void)PE_parse_boot_argn("sweetfb", &hwEnable, sizeof(hwEnable));
++	if (!hwEnable) {
++		IOLog("SWEET FB: disabled by sweetfb=0 (topaz MDP/DSI not ported to lena)\n");
++		return false;
++	}
+ 	topaz_modem_init();
+ 	sweet_busy_init();
+ 	PE_current_console(&video);
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 19f27cd..0192b3f 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -720,6 +720,45 @@ extern unsigned char iso_font[256 * 16];
+ static volatile uint32_t *fbcon_base;
+ static uint32_t fbcon_width, fbcon_height, fbcon_stride;
+ static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
++/* lena diag: every line starts with a 4-hex-digit sequence number, so the
++ * circular screen can be put back in order after an OCR pass. */
++static uint32_t fbcon_line;
++
++static void
++fbcon_put_glyph(uint32_t col, unsigned char ch, uint32_t fg)
++{
++	const unsigned char *glyph = iso_font + ch * 16;
++	uint32_t x0 = col * 8 * FBCON_SCALE, y0 = fbcon_row * 16 * FBCON_SCALE;
++
++	if (col >= fbcon_cols) {
++		return;
++	}
++	for (uint32_t gy = 0; gy < 16; gy++) {
++		for (uint32_t sy = 0; sy < FBCON_SCALE; sy++) {
++			volatile uint32_t *line = fbcon_base + (y0 + gy * FBCON_SCALE + sy) * (fbcon_stride / 4) + x0;
++			for (uint32_t gx = 0; gx < 8; gx++) {
++				uint32_t px = (glyph[gy] & (1u << gx)) ? fg : FBCON_BG;
++				for (uint32_t sx = 0; sx < FBCON_SCALE; sx++) {
++					line[gx * FBCON_SCALE + sx] = px;
++				}
++			}
++		}
++	}
++}
++
++static void
++fbcon_begin_line(void)
++{
++	static const char hex[] = "0123456789abcdef";
++	uint32_t n = fbcon_line++;
++
++	fbcon_put_glyph(0, hex[(n >> 12) & 0xf], 0xff808080u);
++	fbcon_put_glyph(1, hex[(n >> 8) & 0xf], 0xff808080u);
++	fbcon_put_glyph(2, hex[(n >> 4) & 0xf], 0xff808080u);
++	fbcon_put_glyph(3, hex[n & 0xf], 0xff808080u);
++	fbcon_put_glyph(4, ' ', 0xff808080u);
++	fbcon_col = 5;
++}
+ 
+ static void
+ fbcon_clear_row(uint32_t row)
+@@ -747,6 +786,7 @@ fbcon_init(void)
+ 	fbcon_cols = fbcon_width / (8 * FBCON_SCALE);
+ 	fbcon_rows = fbcon_height / (16 * FBCON_SCALE);
+ 	fbcon_col = fbcon_row = 0;
++	fbcon_line = 0;
+ 	for (uint32_t r = 0; r < fbcon_rows; r++) {
+ 		fbcon_clear_row(r);
+ 	}
+@@ -772,19 +812,10 @@ fbcon_transmit_data(uint8_t c)
+ 	if (fbcon_col >= fbcon_cols) {
+ 		fbcon_newline();
+ 	}
+-	const unsigned char *glyph = iso_font + c * 16;
+-	uint32_t x0 = fbcon_col * 8 * FBCON_SCALE, y0 = fbcon_row * 16 * FBCON_SCALE;
+-	for (uint32_t gy = 0; gy < 16; gy++) {
+-		for (uint32_t sy = 0; sy < FBCON_SCALE; sy++) {
+-			volatile uint32_t *line = fbcon_base + (y0 + gy * FBCON_SCALE + sy) * (fbcon_stride / 4) + x0;
+-			for (uint32_t gx = 0; gx < 8; gx++) {
+-				uint32_t px = (glyph[gy] & (1u << gx)) ? FBCON_FG : FBCON_BG;
+-				for (uint32_t sx = 0; sx < FBCON_SCALE; sx++) {
+-					line[gx * FBCON_SCALE + sx] = px;
+-				}
+-			}
+-		}
++	if (fbcon_col == 0) {
++		fbcon_begin_line();
+ 	}
++	fbcon_put_glyph(fbcon_col, c, FBCON_FG);
+ 	fbcon_col++;
+ }
+ 
