@@ -1,0 +1,250 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lena <lena@x>
+Date: Sun, 25 Oct 2026 17:40:00 +0200
+Subject: [PATCH] lena-0150: USB variant table (SM6225/SM6350), decouple from sweethw
+
+The DWC3 core is at the same place on topaz (SM6225) and lena (SM6350):
+0x0a600000, with the Qualcomm QSCRATCH wrapper at core+0xf8800. What
+differs is the GCC power domain / clock register map and the QUSB2 PHY:
+
+  topaz  GDSCR 0x0f004  master 0x0f010  cfg-noc 0x0502c  PHY 0x088e2000
+  lena   GDSCR 0x1a004  master 0x1a00c  cfg-noc 0x1101c  PHY 0x088e3000
+
+(offsets from Linux gcc-sdmmagpie.c / gcc-sm6350.c, PHY addresses from
+the two DTBs). The probe now scores both candidates by reading GCC only
+(always powered, so always safe), picks the board whose USB30_PRIM
+power domain is on with the most USB clocks running, and touches DWC3 -
+and later the PHY - only when that board's GDSCR/master/cfg-noc/phy-ahb
+registers say it is powered and clocked. sweetusb_hw=1/2 forces topaz/
+lena, for the case where auto-detection is ambiguous.
+
+The old code hardcoded the topaz offsets, so on lena the GDSC check
+looked at an unrelated register; with the fixed offsets a lena boot can
+report the controller state and (sweetusb=2) start the ECM gadget for
+the live log over USB.
+
+USB also no longer hangs off sweethw: that boot-arg stays for the
+SM7150-era key/touch drivers, which must keep defaulting to off on lena,
+while USB gets its own switch (sweetusb absent or 0 = untouched, 1 =
+read-only report, 2 = start the device).
+---
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -41,25 +41,32 @@
+ 
+ #define GCC_PA                  0x00100000
+ #define GCC_SIZE                0x00090000
+-#define GCC_USB30_PRIM_GDSCR    0x0f004         /* bit 31: power on */
+ #define CBCR_CLK_OFF            (1u << 31)
++#define GDSC_PWR_ON             (1u << 31)
+ 
+-static const struct {
++/*
++ * 0150: the same DWC3 core sits at 0x0a600000 and the QSCRATCH wrapper at
++ * core+0xf8800 on topaz (SM6225) and on lena (SM6350), but the GCC power
++ * domain / clock registers and the QUSB2 PHY address differ. The offsets are
++ * the GDSCR and the CBCR of each branch from Linux drivers/clk/qcom/
++ * gcc-sdmmagpie.c and gcc-sm6350.c; the PHY addresses come from the two DTBs
++ * (qusb@88e2000 vs qusb@88e3000).
++ */
++struct usb_hw {
+ 	const char *name;
+-	uint32_t    off;
+-} usb_cbcr[] = {
+-	{ "master", 0x0f010 },
+-	{ "sleep", 0x0f014 },
+-	{ "utmi", 0x0f018 },
+-	{ "cfg-noc-axi", 0x0502c },
+-	{ "aggre-axi", 0x8201c },
+-	{ "ahb2phy", 0x6a004 },
+-	{ "clkref", 0x8c010 },
++	uint32_t    gdsc;
++	uint32_t    master, sleep_clk, utmi, cfg_noc, aggre, phy_ahb, phy_ref;
++	uint32_t    phy_pa;
++};
++static const struct usb_hw usb_hw[] = {
++	/* name              gdsc    master  sleep   utmi    cfg-noc aggre   phy-ahb phy-ref phy */
++	{ "topaz/sm6225", 0x0f004, 0x0f010, 0x0f014, 0x0f018, 0x0502c, 0x8201c, 0x6a004, 0x8c010, 0x088e2000 },
++	{ "lena/sm6350",  0x1a004, 0x1a00c, 0x1a014, 0x1a018, 0x1101c, 0x3e010, 0x1a050, 0x1a054, 0x088e3000 },
+ };
++#define USB_HW_COUNT (sizeof(usb_hw) / sizeof(usb_hw[0]))
+ 
+ #define DWC3_PA                 0x0a600000
+ #define DWC3_SIZE               0x0000d000
+-#define QUSB2_PA                0x088e2000
+ #define QUSB2_SIZE              0x00000400
+ 
+ static uint32_t
+@@ -70,33 +77,104 @@
+ 	return v;
+ }
+ 
++/*
++ * A candidate board is only plausible if its USB30_PRIM power domain reports
++ * on; the score is how many of its USB clocks are running (bit 31 of a CBCR
++ * means "clock off"). Reading GCC is always safe - that block is never gated.
++ */
++static int
++usb_hw_score(vm_offset_t gcc, const struct usb_hw *hw)
++{
++	int score = 0;
++
++	if (!(usb_rd(gcc, hw->gdsc) & GDSC_PWR_ON)) {
++		return -1;
++	}
++	if (!(usb_rd(gcc, hw->master) & CBCR_CLK_OFF)) {
++		score++;
++	}
++	if (!(usb_rd(gcc, hw->sleep_clk) & CBCR_CLK_OFF)) {
++		score++;
++	}
++	if (!(usb_rd(gcc, hw->utmi) & CBCR_CLK_OFF)) {
++		score++;
++	}
++	if (!(usb_rd(gcc, hw->cfg_noc) & CBCR_CLK_OFF)) {
++		score++;
++	}
++	if (!(usb_rd(gcc, hw->aggre) & CBCR_CLK_OFF)) {
++		score++;
++	}
++	if (!(usb_rd(gcc, hw->phy_ahb) & CBCR_CLK_OFF)) {
++		score++;
++	}
++	return score;
++}
++
+ void
+ sweet_usb_probe(void)
+ {
+-	int enabled = 1;
+-	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+-	bool clocks_on = true;
+-
+-	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
++	int enabled = 0;
++	int force = 0;
++	const struct usb_hw *hw;
++	uint32_t gdscr, cbcr[7];
++	static const char *const clk_names[7] = {
++		"master", "sleep", "utmi", "cfg-noc-axi", "aggre-axi", "phy-ahb", "phy-ref"
++	};
++	int best = -1, best_score = -1;
++
++	/*
++	 * 0150: USB is no longer tied to sweethw (which gates the SM7150-era
++	 * key/touch drivers). sweetusb=1 reports state only, =2 also starts the
++	 * device; absent or 0 leaves USB completely untouched.
++	 */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
+-	if (!enabled) {
++	if (enabled <= 0) {
+ 		return;
+ 	}
++	/* sweetusb_hw=1 topaz, 2 lena, 0/absent auto (GDSC on, most clocks running). */
++	PE_parse_boot_argn("sweetusb_hw", &force, sizeof(force));
++
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+ 		printf("SWEET USB: GCC map failed\n");
+ 		return;
+ 	}
+-	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
+-	printf("SWEET USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
+-	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+-		cbcr[i] = usb_rd(gcc, usb_cbcr[i].off);
+-		printf("SWEET USB: clk %-12s CBCR 0x%08x (%s)\n", usb_cbcr[i].name, cbcr[i],
++	for (unsigned i = 0; i < USB_HW_COUNT; i++) {
++		int s = usb_hw_score(gcc, &usb_hw[i]);
++
++		printf("SWEET USB: candidate %s gdscr 0x%08x score %d\n",
++		    usb_hw[i].name, usb_rd(gcc, usb_hw[i].gdsc), s);
++		if (s > best_score) {
++			best_score = s;
++			best = (int)i;
++		}
++	}
++	if (force >= 1 && (unsigned)force <= USB_HW_COUNT) {
++		best = force - 1;
++		best_score = usb_hw_score(gcc, &usb_hw[best]);
++		printf("SWEET USB: forced by sweetusb_hw=%d\n", force);
++	}
++	if (best < 0 || best_score < 0) {
++		printf("SWEET USB: no USB30_PRIM power domain on; controller not read\n");
++		return;
++	}
++	hw = &usb_hw[best];
++	gdscr = usb_rd(gcc, hw->gdsc);
++	printf("SWEET USB: using %s, GDSC usb30_prim 0x%08x (%s)\n", hw->name, gdscr,
++	    (gdscr & GDSC_PWR_ON) ? "on" : "off");
++
++	uint32_t offs[7] = {
++		hw->master, hw->sleep_clk, hw->utmi, hw->cfg_noc, hw->aggre,
++		hw->phy_ahb, hw->phy_ref
++	};
++	for (unsigned i = 0; i < 7; i++) {
++		cbcr[i] = usb_rd(gcc, offs[i]);
++		printf("SWEET USB: clk %-12s CBCR 0x%08x (%s)\n", clk_names[i], cbcr[i],
+ 		    (cbcr[i] & CBCR_CLK_OFF) ? "off" : "on");
+ 	}
+ 	/* DWC3 registers need the GDSC, the master clock and the config-NoC path. */
+-	clocks_on = (gdscr & (1u << 31)) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF);
+-	if (!clocks_on) {
++	if (!((gdscr & GDSC_PWR_ON) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF))) {
+ 		printf("SWEET USB: controller unpowered or unclocked; DWC3 not read\n");
+ 		return;
+ 	}
+@@ -117,18 +195,19 @@
+ 		sweet_usb_gadget_start(dwc);
+ 	}
+ 	if (cbcr[5] & CBCR_CLK_OFF) {
+-		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
++		printf("SWEET USB: phy-ahb clock off; QUSB2 PHY not read\n");
+ 		return;
+ 	}
+-	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++	vm_offset_t phy = ml_io_map(hw->phy_pa, QUSB2_SIZE);
+ 	if (phy == 0) {
++		printf("SWEET USB: QUSB2 map failed\n");
+ 		return;
+ 	}
+ 	/* DT qcom,qusb-phy-reg-offset order (Linux phy-msm-qusb-v2.c): PORT_TUNE1 0x240,
+ 	 * PLL_COMMON_STATUS_ONE 0x1a0, PWR_CTRL1 0x210, INTR_CTRL 0x230,
+ 	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
+-	printf("SWEET USB: QUSB2 PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
+-	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
++	printf("SWEET USB: QUSB2 (0x%08x) PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
++	    hw->phy_pa, usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
+ }
+ 
+ /*
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -846,19 +846,23 @@
+ 	sweet_sample_start();
+ 	/*
+ 	 * Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp).
+-	 * They still poke SM7150 MMIO (SPMI, GENI SE7, DWC3 at 0xa600000); on
+-	 * lena/topaz that faults or hangs, so they only run with sweethw=1 until
+-	 * ported.
++	 * They still poke SM7150 MMIO (SPMI, GENI SE7); on lena that faults or
++	 * hangs, so they only run with sweethw=1 until ported.
+ 	 */
+ 	int hw = 0;
+ 	(void)PE_parse_boot_argn("sweethw", &hw, sizeof(hw));
+ 	if (hw == 1) {
+ 		sweet_keys_init();
+ 		sweet_touch_init();
+-		sweet_usb_probe();
+ 	} else {
+-		printf("SWEET UFS: keys/touch/USB skipped (lena, sweethw=0)\n");
++		printf("SWEET UFS: keys/touch skipped (lena, sweethw=0)\n");
+ 	}
++	/*
++	 * 0150: USB is driven by its own boot-arg (sweetusb=1 report, 2 start
++	 * the ECM gadget for the live log). It must work with sweethw=0, which
++	 * stays the default on lena.
++	 */
++	sweet_usb_probe();
+ 	return 0;
+ }
+ 
