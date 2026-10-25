@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lena <lena@x>
+Date: Sun, 25 Oct 2026 15:30:00 +0200
+Subject: [PATCH] lena-0147: 1 s heartbeat with UFS counters, per-second UFS
+ stall trace
+
+After 0144 the boot reaches launchd_cache_loader and reads 64 MiB at
+186-218 MiB/s, but both diagnostic paths stop at the same moment: the
+panel console goes silent and the persisted ring stops at flush #25
+(HB 60 s). Two independent sinks dying together says the kernel stopped,
+not that only the log persistence starved - but a 10 s heartbeat cannot
+show where, and there is no adb in iOS (sweethw=0), so the panel is the
+only instrument.
+
+Three changes, all visible on the panel within one second:
+
+- the heartbeat prints every second (boot-arg sweethb_ms, default 1000)
+  with the UFS read command and MiB counters attached: seconds keep
+  counting while the counters freeze => the UFS poll loop hung; both
+  stop => the whole kernel did;
+- ufs_scsi() prints "still waiting N s cmd 0x.." once per second while
+  polling the doorbell, so a stuck command is visible before the 5 s
+  timeout instead of only in the first 20 slow-read lines;
+- the log flush thread measures how long it blocks on sweet_ufs_lock and
+  prints "flush blocked N s" above one second, separating lock starvation
+  from a device stall.
+
+Only diagnostics: no timing, protocol or scanout behaviour changes.
+---
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -469,10 +469,16 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ static volatile int sweet_diag_stage;   /* 0 = inside bsd_init, 2 = init started */
+ 
++/*
++ * 0147: read counters from bsd/dev/sweet_ufs.c, printed by the heartbeat.
++ */
++extern void sweet_ufs_counters(uint64_t *reads, uint64_t *kib);
++
+ static void
+ sweet_diag_heartbeat(void *arg, wait_result_t wr)
+ {
+ 	unsigned int secs = 0;
++	int period = 1000;                      /* boot-arg sweethb_ms, default 1 s */
+ 
+ 	(void)arg;
+ 	(void)wr;
+@@ -481,12 +487,28 @@
+ 	 * told "blocked in bsd_init" from "SoC dead"; after it the same is true
+ 	 * for the userspace phase (launchd, backboardd), which is where the boot
+ 	 * now lives. Stops after 10 minutes so it does not run forever.
++	 *
++	 * 0147: 1 s instead of 10 s, with the UFS read counters attached. Two
++	 * paths going silent together (the panel console and the persisted ring)
++	 * says the kernel stopped, and a 10 s period was too coarse to see where.
++	 * If the counters stop while the seconds keep counting, the UFS poll
++	 * loop is what hangs; if both stop, the whole kernel did.
+ 	 */
+-	while (secs < 600) {
+-		IOSleep(10000);
+-		secs += 10;
+-		printf("SWEET HB: alive %u s (%s)\n", secs,
+-		    sweet_diag_stage < 2 ? "bsd_init" : "userspace");
++	PE_parse_boot_argn("sweethb_ms", &period, sizeof(period));
++	if (period < 100) {
++		period = 1000;
++	}
++	while (secs < 600000) {
++		IOSleep((unsigned)period);
++		secs += (unsigned)period;
++		{
++			uint64_t reads = 0, kib = 0;
++
++			sweet_ufs_counters(&reads, &kib);
++			printf("SWEET HB: alive %u.%us reads=%llu %lluMiB (%s)\n",
++			    secs / 1000, (secs % 1000) / 100, reads, kib >> 10,
++			    sweet_diag_stage < 2 ? "bsd_init" : "userspace");
++		}
+ 	}
+ }
+ 
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -223,13 +223,31 @@
+ 		spin_until += mach_absolute_time();
+ 		nanoseconds_to_absolutetime(CMD_SLEEP_NS, &sleep_interval);
+ 	}
++	/*
++	 * 0147: a stuck command used to be invisible until the 5 s timeout
++	 * (and only the first 20 slow reads were logged). A line every second
++	 * of polling shows on the panel that the kernel is alive but the
++	 * device is not answering, which is the state we want to catch.
++	 */
++	uint64_t last_wait = start;
+ 	while (ufs_rd(REG_UTRLDBR) & 1) {
+ 		uint64_t now = mach_absolute_time();
++		uint64_t waited_ns;
++
+ 		if (now > deadline) {
+ 			ufs_wr(REG_UTRLCLR, ~1u);
+ 			printf("SWEET UFS: command 0x%02x timed out\n", cdb[0]);
+ 			return ETIMEDOUT;
+ 		}
++		absolutetime_to_nanoseconds(now - last_wait, &waited_ns);
++		if (waited_ns >= NSEC_PER_SEC) {
++			uint64_t total_ns;
++
++			absolutetime_to_nanoseconds(now - start, &total_ns);
++			last_wait = now;
++			printf("SWEET UFS: still waiting %llu s cmd 0x%02x\n",
++			    total_ns / NSEC_PER_SEC, cdb[0]);
++		}
+ 		if (sleepable && now >= spin_until) {
+ 			uint64_t wake = now + MIN(sleep_interval, deadline - now);
+ 			/* Keep the mutex: slot 0 and the bounce buffer are still owned. */
+@@ -961,6 +979,20 @@
+ 	uint64_t total, seq;
+ };
+ 
++/*
++ * 0147: read counters for the heartbeat line. If the seconds keep counting
++ * while these freeze, the UFS poll loop is what hangs; if both stop, the
++ * whole kernel did.
++ */
++void sweet_ufs_counters(uint64_t *reads, uint64_t *kib);
++
++void
++sweet_ufs_counters(uint64_t *reads, uint64_t *kib)
++{
++	*reads = os_atomic_load(&su.reads, relaxed);
++	*kib = os_atomic_load(&su.read_kib, relaxed);
++}
++
+ static void
+ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -976,7 +1008,19 @@
+ 			uint64_t pos = total - flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : flushed;
+ 			int error = 0;
+ 
+-			lck_mtx_lock(&sweet_ufs_lock);
++			uint64_t lock_wait_ns = 0;
++
++			{
++				uint64_t t0 = mach_absolute_time();
++
++				lck_mtx_lock(&sweet_ufs_lock);
++				absolutetime_to_nanoseconds(mach_absolute_time() - t0,
++				    &lock_wait_ns);
++			}
++			if (lock_wait_ns >= NSEC_PER_SEC) {
++				printf("SWEET LOG: flush blocked %llu s waiting for the UFS lock\n",
++				    lock_wait_ns / NSEC_PER_SEC);
++			}
+ 			while (pos < total && !error) {
+ 				uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
+ 				uint32_t blk = off / UFS_BLOCK;

@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lena <lena@x>
+Date: Sun, 25 Oct 2026 16:20:00 +0200
+Subject: [PATCH] lena-0146: flip by flushing the whole CTL, dump the panel path
+
+0143 latched a flip with CTL_FLUSH = VIG0-bit | 0x20000 and the panel
+stopped updating as soon as the console was retargeted into the shadow
+buffer. A frozen image with a live kernel means the new SSPP_SRC0_ADDR
+never latched: the panel kept fetching the old buffer while the console
+painted into the new one. The guessed flush bit is therefore wrong for
+this DPU.
+
+Flush every bit instead (CTL_FLUSH = 0xffffffff). A flush bit for a block
+with no pending registers is a no-op, so this cannot push stale state into
+the panel path, and the source pipe is guaranteed to latch.
+
+Also stop picking the CTL by CTL_TOP != 0: on this DPU CTL0+0x14 reads
+0x20000, which is not a mixer bitmask (the DTB's qcom,sde-ctl-display-pref
+is "primary,none,none,none", so CTL0 is the one ABL bound). Log all four
+CTL_TOP/LAYER_0/FLUSH/START values and dump CTL0, MIXER0, PP0 and INTF1 so
+a failed flip can be read from the log instead of guessed at (reads only,
+the whole block is powered by ABL and actively scanning out).
+---
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -260,6 +260,23 @@
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/* 0146: MMIO dump of one block, to see what ABL left behind (reads only) */
++static void
++sweet_dump(const char *tag, volatile uint32_t *base, int words)
++{
++	if (base == NULL) {
++		IOLog("SWEET FB: %s not mapped\n", tag);
++		return;
++	}
++	for (int i = 0; i < words; i += 8) {
++		IOLog("SWEET FB: %s +%#04x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
++		    tag, i * 4,
++		    base[(i + 0) % words], base[(i + 1) % words], base[(i + 2) % words],
++		    base[(i + 3) % words], base[(i + 4) % words], base[(i + 5) % words],
++		    base[(i + 6) % words], base[(i + 7) % words]);
++	}
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -357,21 +374,33 @@
+ 		}
+ 	}
+ 	if (fVig0 != NULL) {
+-		/* the CTL that already has a mixer bound is the one feeding DSI0 */
++		/*
++		 * 0146: the CTL that feeds the panel is the primary one - the DTB's
++		 * qcom,sde-ctl-display-pref says "primary,none,none,none" and CTL0 is
++		 * the one ABL bound. Do not pick it by CTL_TOP being non-zero: on this
++		 * DPU CTL_TOP (0x14) reads 0x20000, which is not a mixer bitmask, so
++		 * that heuristic happened to work but proved nothing.
++		 */
+ 		static const uint32_t ctlOff[4] = { 0x02000, 0x02200, 0x02400, 0x02600 };
+ 
+ 		for (i = 0; i < 4; i++) {
+ 			volatile uint32_t *c = (volatile uint32_t *)ml_io_map(0x0ae00000 + ctlOff[i], 0x1000);
+-			uint32_t top = c != NULL ? c[0x14 / 4] : 0;      /* CTL_TOP: bound mixers */
++			uint32_t top = c != NULL ? c[0x14 / 4] : 0;
+ 
+-			IOLog("SWEET FB: lena CTL%d top %#x\n", i, top);
+-			if (c != NULL && top != 0) {
+-				fCtl0 = c;
+-				break;
+-			}
+-		}
+-		if (fCtl0 == NULL) {
+-			IOLog("SWEET FB: lena no bound CTL, flips disabled\n");
++			IOLog("SWEET FB: lena CTL%d top %#x layer0 %#x flush %#x start %#x\n", i, top,
++			    c != NULL ? c[0x00 / 4] : 0, c != NULL ? c[0x18 / 4] : 0,
++			    c != NULL ? c[0x1c / 4] : 0);
++		}
++		fCtl0 = (volatile uint32_t *)ml_io_map(0x0ae00000 + ctlOff[0], 0x1000);
++		if (fCtl0 != NULL) {
++			/* dump the blocks the panel path goes through, so a failed flip
++			 * can be told from a wrong flush bit (all MMIO reads, harmless) */
++			sweet_dump("CTL0", fCtl0, 24);
++			sweet_dump("MIXER0", (volatile uint32_t *)ml_io_map(0x0ae45000, 0x1000), 16);
++			sweet_dump("PP0", (volatile uint32_t *)ml_io_map(0x0ae71000, 0x1000), 16);
++			sweet_dump("INTF1", (volatile uint32_t *)ml_io_map(0x0ae6b800, 0x1000), 40);
++		} else {
++			IOLog("SWEET FB: lena no CTL0, flips disabled\n");
+ 			fVig0 = NULL;
+ 			fScanFlushBit = 0;
+ 		}
+@@ -666,8 +695,14 @@
+ 	fVig0[0x14 / 4] = (uint32_t)pa;
+ 	fVig0[0x24 / 4] = stride;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	/* flush the probed source pipe + CTL: latched at the next vsync */
+-	fCtl0[0x18 / 4] = fScanFlushBit | 0x20000;
++	/*
++	 * 0146: flush everything instead of guessing this DPU's CTL_FLUSH bit for
++	 * VIG0. With the guessed bit the write to SRC0 stayed pending: the console
++	 * retargeted into the shadow buffer while the panel kept scanning the old
++	 * one (frozen log, kernel alive). Flushing a block that has no pending
++	 * registers is a no-op, so ones are safe.
++	 */
++	fCtl0[0x18 / 4] = 0xffffffffu;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	fScanPhys = pa;
+ 	fScanStride = stride;
