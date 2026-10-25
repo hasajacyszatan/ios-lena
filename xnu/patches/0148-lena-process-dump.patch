@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lena <lena@x>
+Date: Sun, 25 Oct 2026 16:10:00 +0200
+Subject: [PATCH] lena-0148: dump every process with its wait channel every 5 s
+
+0147 answered where the boot stops: the kernel runs (heartbeat to 546 s
+and beyond, ring flushing to #621), NO UFS command is in flight (no
+"still waiting", no "timed out", no "flush blocked"), and the read
+counters freeze at 1517 cmds / 93 MiB between HB 32 s and 33 s - right
+after "exec launchd_cache_loader", the last non-heartbeat line in the
+log. Nothing reads the disk any more, so the stall is not in the UFS
+driver: a process is blocked somewhere else (or never started).
+
+A wait channel is the only thing that tells which. Every 5 s (boot-arg
+sweetps_ms, default 5000, under sweetdiag=1) walk allproc and print per
+process:
+
+  SWEET PS: <pid> <state> <name> |<wmesg>@<wchan> ...
+
+where the state letter is I/R/S/T/Z and the pipe fields come from each
+uthread's uu_wmesg/uu_wchan (vnode_sleep, psynch_mutexwait, mach_msg,
+...). A missing launchd_cache_loader process means the exec failed; a
+present one with vnode_sleep points at the filesystem, mach_msg at an
+XPC nobody answers, and a growing process count shows work continuing.
+The free page count is printed with the header: vm_page_free_count == 0
+would mean the stall is memory, not a lock.
+---
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -512,6 +512,62 @@
+ 	}
+ }
+ 
++/*
++ * 0148: who is blocked on what. The 0147 boot answered the previous question
++ * (the kernel is alive, the log flushes, and NO UFS command is in flight - no
++ * "still waiting", counters frozen at 1517 cmds / 93 MiB): after
++ * `exec launchd_cache_loader` nothing reads the disk any more, so the stall is
++ * a process waiting somewhere that is not the UFS driver. This dumps every
++ * process with its uthreads' wait messages/channels, e.g.
++ *   SWEET PS:   412 S launchd_cache_loader |vnode_sleep@0xffff...
++ * which distinguishes a vnode/lock wait, a mach_msg nobody answers, a
++ * psynch mutex, a memory wait, or simply a missing process (exec failed).
++ */
++extern unsigned int vm_page_free_count;
++
++static void
++sweet_diag_procs(void)
++{
++	struct proc *p;
++
++	proc_list_lock();
++	for (p = allproc.lh_first; p != NULL; p = p->p_list.le_next) {
++		struct uthread *ut;
++
++		proc_lock(p);
++		printf("SWEET PS: %5d %c %.16s", (int)p->p_pid,
++		    (p->p_stat > 0 && p->p_stat <= 5) ? " ?IRSZ"[p->p_stat] : '?',
++		    p->p_comm);
++		TAILQ_FOREACH(ut, &p->p_uthlist, uu_list) {
++			if (ut->uu_wmesg != NULL) {
++				printf(" |%s@%p", ut->uu_wmesg, ut->uu_wchan);
++			} else if (ut->uu_wchan != NULL) {
++				printf(" |@%p", ut->uu_wchan);
++			}
++		}
++		printf("\n");
++		proc_unlock(p);
++	}
++	proc_list_unlock();
++}
++
++static void
++sweet_diag_procs_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	int period = 5000;                      /* boot-arg sweetps_ms */
++
++	PE_parse_boot_argn("sweetps_ms", &period, sizeof(period));
++	if (period < 500) {
++		period = 5000;
++	}
++	printf("SWEET PS: process dump every %d ms (pid state name | wmesg@wchan), free pages %u\n",
++	    period, vm_page_free_count);
++	for (;;) {
++		IOSleep((unsigned)period);
++		sweet_diag_procs();
++	}
++}
++
+ static void
+ sweet_diag_start(void)
+ {
+@@ -521,10 +577,13 @@
+ 	if (!PE_parse_boot_argn("sweetdiag", &on, sizeof(on)) || on == 0) {
+ 		return;
+ 	}
+-	printf("SWEET DIAG: heartbeat thread every 10 s\n");
++	printf("SWEET DIAG: heartbeat every 1 s, process dump every 5 s (sweethb_ms/sweetps_ms)\n");
+ 	if (kernel_thread_start(sweet_diag_heartbeat, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	if (kernel_thread_start(sweet_diag_procs_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
