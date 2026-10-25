@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lena <lena@x>
+Date: Sun, 25 Oct 2026 17:05:00 +0200
+Subject: [PATCH] lena-0149: start the process dump only after bsd_init finishes
+
+The 0148 boot panicked at the first process dump. The persisted ring ends
+at "SWEET HB: alive 4.0s reads=2 0MiB (bsd_init)" and contains no
+"SWEET PS:" line at all, so the crash happened inside or just before the
+first dump (5 s period), while the init thread was still inside bsd_init.
+
+sweet_diag_start() runs before bsd_init's body, i.e. possibly before
+procinit(): allproc, proc_list_mlock and the per-proc p_mlock are not
+initialized yet at 5 s, and proc_list_lock() on an uninitialized mutex
+panics. (USB is not involved: the same log says "keys/touch/USB skipped
+(lena, sweethw=0)".)
+
+Wait for sweet_diag_stage == 2, which is raised right before
+load_init_program() after all BSD/VM/filesystem init, and announce the
+dump then. Userspace is the phase the dump is for anyway, so nothing is
+lost; the first dump now lands shortly after launchd starts.
+---
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -555,15 +555,34 @@
+ sweet_diag_procs_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	int period = 5000;                      /* boot-arg sweetps_ms */
++	bool announced = FALSE;
+ 
+ 	PE_parse_boot_argn("sweetps_ms", &period, sizeof(period));
+ 	if (period < 500) {
+ 		period = 5000;
+ 	}
+-	printf("SWEET PS: process dump every %d ms (pid state name | wmesg@wchan), free pages %u\n",
+-	    period, vm_page_free_count);
+ 	for (;;) {
+ 		IOSleep((unsigned)period);
++		/*
++		 * 0149: do NOT touch allproc before bsd_init has finished the
++		 * process/VM setup. The 0148 boot panicked at the first dump 5 s
++		 * in (ring stops at "SWEET HB: alive 4.0s ... (bsd_init)", no
++		 * PS line at all): at that point the init thread was still
++		 * inside bsd_init, i.e. possibly before procinit(), where
++		 * allproc/proc_list_mlock/p_mlock are not initialized yet, and
++		 * proc_list_lock() on an uninitialized mutex panics.
++		 * sweet_diag_stage is raised to 2 right before load_init_program,
++		 * after all the BSD/VM/filesystem init, so from there on the
++		 * locks are valid - and userspace is exactly the phase we need.
++		 */
++		if (sweet_diag_stage < 2) {
++			continue;
++		}
++		if (!announced) {
++			announced = TRUE;
++			printf("SWEET PS: process dump every %d ms (pid state name | wmesg@wchan), free pages %u\n",
++			    period, vm_page_free_count);
++		}
+ 		sweet_diag_procs();
+ 	}
+ }
