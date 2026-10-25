@@ -2,6 +2,50 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-25 lena (Xperia 10 III / pdx213): first boot into launchd <<<
+
+**iOS now reaches userspace on lena.** Repo `hasajacyszatan/ios-lena`, branch `lena` (HEAD `abf78fc`).
+Kernel CI: `gh workflow run xnu.yml -R hasajacyszatan/ios-lena --ref lena` (push to `lena` also builds;
+run `40141908236` = kernel with 0140+0141, artifact `xnu-kernel`).
+
+- **0140 (commit `e74957e`)**: 4-hex line counter prefix in the fbcon (screen order is only
+  decodable with it: 78-row circular buffer that wraps to the top), `DEBUG_BSDINIT 1`,
+  `SWEET BSD: bsd_init entered / root mounted / starting init`, `sweetdiag=1` heartbeat thread
+  (stops itself at `starting init` - it says nothing about the userspace phase), `sweetfb=0` gate
+  for AppleCLCD (it still programs topaz MDP `0x5e05000`/DSI `0x5e94000`).
+- **0141 (commit `abf78fc`)**: **the persistent console log now starts before IOKit matching**
+  (`sweet_ufs_early()` called from `startup.c` just before `PE_lockdown_iokit()`, gated by
+  `sweetdiag=1`). devfs nodes moved to an idempotent `sweet_ufs_nodes()` (devfs does not exist
+  before `vfsinit()`, the root mount completes them; the mount only needs the dev_t). Log flush is
+  now the FIRST thing in the loop (no initial sleep) and every 100 ms under `sweetdiag=1`.
+  **Reading logs is now `fastboot reboot recovery` -> `tools/sweet-log-pull.sh OUT.txt` (TWRP,
+  adb root); no more filming the screen.** Ring is the last 4 MiB+4 KiB of `userdata` (`sda79`).
+- Boot image: `shim/out/shim-boot-lena.img` built by `shim/build-lena.sh` with
+  `PATH=~/.local/usr/bin:$PATH LD_LIBRARY_PATH=... DTB=/home/kamil/xperia-backup/boot_unpacked/dtb MKBOOTIMG=mkbootimg`;
+  payload = `tools/mkpayload.py <kernel> shim/out/lena.adt shim/out/payload.bin --cmdline "..."`.
+  Flash with **`fastboot flash boot_b <img>`** (`fastboot boot` = `remote: 'unknown command'` on this
+  device), slot b active. Cmdline now: `... sweethw=0 sweetcpufreq=0 sweetbattery=0 sweetfb=0
+  sweetfb_noconsole=1 sweetdiag=1 launchd_unsecure_cache=1`.
+- **Frozen-boot root causes, both fixed by boot-args (no code change needed):**
+  `SweetBattery::start()` -> `sweet_i2c1_init()` programmed topaz GCC `0x1400000`/TLMM `0x500000`
+  (hangs the SoC) -> `sweetbattery=0`; AppleCLCD topaz MDP/DSI -> `sweetfb=0`.
+- **Boot progress (log `/tmp/opencode/log0141b.txt`, 38 kB, flush #24):** early UFS OK
+  (`userdata` LUN0, first block 0x3ade3e, rw) -> `bsd_init entered` -> **`root mounted: ufsroot0`
+  (hfs journal replay ok)** -> `starting init (/sbin/launchd)` -> launchd boot tasks pass:
+  mount-phase-1/2, seputil, obliterator, fips, keybagd (MKB_INIT), usermanagerd (personas),
+  dirs_cleaner, xpcroleaccountd, auearlyboot ("End Early Boot" = the text on screen), tzinit,
+  sysstatuscheck, prng_seedctl -> **stops at `exec launchd_cache_loader`** (t = 45 s of launchd's
+  1970 clock). Cosmetic-only errors there: data volume missing, BindFS /private/preboot, tzinit,
+  prng seed - expected on this image.
+- **NEXT (in order):** 1) re-run and wait 4-5 min without forcing power-off to decide whether
+  `launchd_cache_loader` is a stall or just the ~1 GB dyld cache being read through the polled UFS
+  path (consider boot-args `ufswait=1`/`ufscache=1`: with 1 CPU a polling driver monopolises the
+  core); 2) heartbeat must keep running past `starting init` (it currently switches itself off
+  exactly when userspace starts); 3) **port the display** - AppleCLCD: MDP `0xae00000`, DSI0
+  `0xae94000`, INTF `0xaeb0000`, dispcc `0xaf00000` (lena), else iOS can never draw; 4) input
+  (touch over I2C/GENI, keys over SPMI) currently gated by `sweethw=0`; 5) USB/adb would end the
+  screen-photography era for good (`sweet_usb_probe` still assumes topaz DWC3).
+
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
 **LIVE LOG over USB (0077, boot 0077s): no more recovery round-trips.** Boot an image with `sweetusb=2`, run `tools/sweet-usbnet.sh logs/live-NAME.txt` on the PC: it waits for the phone's CDC-ECM interface, sets 192.168.7.1/24 (sudo) and prints/saves the kernel console the phone streams every 100 ms as UDP to 192.168.7.1:5140 (starts with the last 64 KiB). `ping 192.168.7.2` checks the link. Current image: `shim/out/shim-boot-0077s.img` (kernel 0077, ADT sweet-0069hi, cpus=6, sweetfb_noconsole=1, sweetfb_hz=30, sweetusb=2). The recovery pull (`tools/sweet-log-pull.sh`) is still the way after a panic/hang before USB comes up.

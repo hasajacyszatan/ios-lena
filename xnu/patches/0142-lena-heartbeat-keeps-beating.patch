@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lena <lena@x>
+Date: Sun, 25 Oct 2026 02:10:00 +0200
+Subject: [PATCH] lena-0142: heartbeat keeps beating after load_init_program
+
+0140 stopped the heartbeat thread at "starting init", exactly where the
+boot moved to userspace and where stalls are now happening. Keep it running
+for 10 minutes, tagged bsd_init/userspace, so a blocked thread can still be
+told from a dead SoC during launchd.
+---
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 4644d64..d9f5acd 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -476,13 +476,17 @@ sweet_diag_heartbeat(void *arg, wait_result_t wr)
+ 
+ 	(void)arg;
+ 	(void)wr;
+-	while (sweet_diag_stage < 2 && secs < 600) {
++	/*
++	 * 0142: keep beating after load_init_program(): before it the thread
++	 * told "blocked in bsd_init" from "SoC dead"; after it the same is true
++	 * for the userspace phase (launchd, backboardd), which is where the boot
++	 * now lives. Stops after 10 minutes so it does not run forever.
++	 */
++	while (secs < 600) {
+ 		IOSleep(10000);
+ 		secs += 10;
+-		if (sweet_diag_stage >= 2) {
+-			break;
+-		}
+-		printf("SWEET HB: alive %u s (bsd_init)\n", secs);
++		printf("SWEET HB: alive %u s (%s)\n", secs,
++		    sweet_diag_stage < 2 ? "bsd_init" : "userspace");
+ 	}
+ }
+ 
