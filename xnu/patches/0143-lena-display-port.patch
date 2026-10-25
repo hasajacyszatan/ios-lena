@@ -1,0 +1,191 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lena <lena@x>
+Date: Sun, 25 Oct 2026 03:10:00 +0200
+Subject: [PATCH] lena-0143: display port, probed MDP at 0xae00000
+
+AppleCLCD now programs lena's display block instead of topaz's:
+
+  mdss        0xae00000   (was 0x05e00000)
+  SSPP VIG0   0xae05000   sde-sspp-off = <0x5000 0x25000 0x27000 0x29000>
+  SSPP DMA0..2 0xae25000 0xae27000 0xae29000  ("vig","dma","dma","dma")
+  CTL0..3     0xae02000 0xae02200 0xae02400 0xae02600
+  DSI0 INTF   0xae06b800  (sde-intf-off 0x6b000 0x6b800 = dp, dsi)
+  DSI0 ctrl   0xae94000
+
+Nothing is trusted blindly: start() reads SRC0_ADDR/YSTRIDE0 of all four
+pipes and only uses a pipe for flips when it is already fetching the boot
+framebuffer (same address, same stride). The CTL is picked by a non-zero
+CTL_TOP, i.e. the one that has a mixer bound and is feeding the panel. If
+either probe fails the driver keeps fVig0 == NULL and present() composes
+into the boot framebuffer, which the panel already scans out (slow, but
+the panel cannot go dark because of a wrong guess). sweetfb_flips=0 forces
+that path without a rebuild.
+
+CTL_FLUSH now carries the probed pipe's flush bit instead of topaz's
+hardcoded VIG0 (0x20001); the CTL bit (17) is unchanged in SM6350.
+
+DSI (DCS brightness, panel on/off) and the INTF frame counters are mapped
+only with sweetfb_dsi=1: the panel is driven in video mode by ABL and
+CMD_MODE_EN on a mode it does not expect is how the topaz port hung.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index e80b2bc..fdd79a3 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -160,6 +160,7 @@ public:
+ 	uint32_t      fIntfFrames;
+ 	uint64_t      fScanPhys;      /* what VIG0 currently fetches */
+ 	uint32_t      fScanStride;
++	uint32_t      fScanFlushBit;  /* CTL_FLUSH bit of the probed source pipe */
+ 	uint32_t      fBootSrc, fBootStride;
+ 	bool          directPresent(const uint8_t *rec);
+ 	void          scanFrom(uint64_t pa, uint32_t stride);
+@@ -269,16 +270,17 @@ AppleCLCD::start(IOService *provider)
+ 		return false;
+ 	}
+ 	/*
+-	 * lena: the display driver below still programs topaz registers
+-	 * (MDP 0x5e0xxxx, DSI 0x5e94000). On SM6350 those addresses belong to
+-	 * nothing (MDP is 0xae00000, DSI0 0xae94000) and touching them hangs the
+-	 * matching thread, which in turn blocks bsd_init waiting for IOKit to
+-	 * quiesce. Keep everything below the gate until the driver is ported;
+-	 * the prompt console keeps running on the ABL framebuffer.
++	 * lena: the display block moved from topaz's 0x5e00000 to 0xae00000.
++	 * Nothing below trusts that address blindly: the MDP is probed first and
++	 * a pipe is only used for flips when it is already fetching the boot
++	 * framebuffer (same address, same stride). Without such a pipe the
++	 * driver composes straight into the boot framebuffer, which the panel
++	 * already scans out, so a wrong guess cannot leave a dead panel.
++	 * sweetfb=0 keeps the whole driver off.
+ 	 */
+ 	(void)PE_parse_boot_argn("sweetfb", &hwEnable, sizeof(hwEnable));
+ 	if (!hwEnable) {
+-		IOLog("SWEET FB: disabled by sweetfb=0 (topaz MDP/DSI not ported to lena)\n");
++		IOLog("SWEET FB: disabled by sweetfb=0\n");
+ 		return false;
+ 	}
+ 	topaz_modem_init();
+@@ -319,9 +321,75 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
+-	fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
+-	fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
+-	fDsi = (volatile uint8_t *)ml_io_map(0x05e94000, 0x1000);
++	/*
++	 * lena (SM6350): mdss at 0xae00000 (qcom/lagoon-sde.dtsi:
++	 * sde-sspp-off = <0x5000 0x25000 0x27000 0x29000> for "vig","dma"...,
++	 * sde-ctl-off = <0x2000 0x2200 0x2400 0x2600>,
++	 * sde-intf-off = <0x6b000 0x6b800> (dp, dsi), so DSI0's timing engine is
++	 * mdss+0x6b800; DSI0 controller 0xae94000).
++	 */
++	static const uint32_t pipeOff[4] = { 0x05000, 0x25000, 0x27000, 0x29000 };
++	static const uint32_t pipeFlush[4] = { 1u, 1u << 11, 1u << 12, 1u << 24 };   /* VIG0, DMA0..2 */
++	static const char * const pipeName[4] = { "VIG0", "DMA0", "DMA1", "DMA2" };
++	uint32_t dsiOn = 0;
++	int i;
++
++	(void)PE_parse_boot_argn("sweetfb_dsi", &dsiOn, sizeof(dsiOn));
++	fVig0 = NULL;
++	fCtl0 = NULL;
++	fScanFlushBit = 0;
++	for (i = 0; i < 4; i++) {
++		volatile uint32_t *p = (volatile uint32_t *)ml_io_map(0x0ae00000 + pipeOff[i], 0x1000);
++		uint32_t src, stride;
++
++		if (p == NULL) {
++			IOLog("SWEET FB: lena pipe %s not mapped\n", pipeName[i]);
++			continue;
++		}
++		src = p[0x14 / 4];       /* SSPP_SRC0_ADDR */
++		stride = p[0x24 / 4];    /* SSPP_SRC_YSTRIDE0 */
++		IOLog("SWEET FB: lena pipe %s src %#x stride %u (boot fb %#llx/%u)\n",
++		    pipeName[i], src, stride, fPhys, fRowBytes);
++		if (fVig0 == NULL && src == (uint32_t)fPhys && stride == fRowBytes) {
++			fVig0 = p;
++			fScanFlushBit = pipeFlush[i];
++			IOLog("SWEET FB: lena scanout pipe is %s, flips enabled\n", pipeName[i]);
++		}
++	}
++	if (fVig0 != NULL) {
++		/* the CTL that already has a mixer bound is the one feeding DSI0 */
++		static const uint32_t ctlOff[4] = { 0x02000, 0x02200, 0x02400, 0x02600 };
++
++		for (i = 0; i < 4; i++) {
++			volatile uint32_t *c = (volatile uint32_t *)ml_io_map(0x0ae00000 + ctlOff[i], 0x1000);
++			uint32_t top = c != NULL ? c[0x14 / 4] : 0;      /* CTL_TOP: bound mixers */
++
++			IOLog("SWEET FB: lena CTL%d top %#x\n", i, top);
++			if (c != NULL && top != 0) {
++				fCtl0 = c;
++				break;
++			}
++		}
++		if (fCtl0 == NULL) {
++			IOLog("SWEET FB: lena no bound CTL, flips disabled\n");
++			fVig0 = NULL;
++			fScanFlushBit = 0;
++		}
++	} else {
++		IOLog("SWEET FB: lena no pipe scans out the boot fb, composing into it\n");
++	}
++	if (fVig0 != NULL) {
++		uint32_t flips = 1;
++
++		(void)PE_parse_boot_argn("sweetfb_flips", &flips, sizeof(flips));
++		if (!flips) {
++			IOLog("SWEET FB: lena flips disabled by sweetfb_flips=0, composing into the boot fb\n");
++			fVig0 = NULL;
++			fCtl0 = NULL;
++			fScanFlushBit = 0;
++		}
++	}
++	fDsi = dsiOn ? (volatile uint8_t *)ml_io_map(0x0ae94000, 0x1000) : NULL;
+ 	fDsiBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, page_size, 0x00000000fffff000ull);
+ 	fDsiBufPhys = fDsiBuf ? fDsiBuf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+@@ -363,10 +431,10 @@ AppleCLCD::start(IOService *provider)
+ 		}
+ 	}
+ 	OSSafeReleaseNULL(accel);
+-	/* dpu sm6115 catalog: intf_1 at mdp+0x6a800, mdp at 0x5e01000 */
+-	fIntf1 = (volatile uint32_t *)ml_io_map(0x05e6b000, 0x1000);
++	/* DSI0 timing engine: intf_1 = mdss + 0x6b800 on lagoon, mdss + 0x6a800 on blair */
++	fIntf1 = dsiOn ? (volatile uint32_t *)ml_io_map(0x0ae6b800, 0x1000) : NULL;
+ 	if (fIntf1 != NULL) {
+-		volatile uint32_t *r = fIntf1 + 0x800 / 4;
++		volatile uint32_t *r = fIntf1;
+ 		r[0x0a8 / 4] = 0x3;     /* FRAME_LINE_COUNT_EN */
+ 		IOLog("SWEET INTF1: te_en %#x config %#x hsync %#x vsync_period %#x hctl %#x active_hctl %#x vstart %#x vend %#x fmt %#x cmd_trig %#x\n",
+ 		    r[0x000 / 4], r[0x004 / 4], r[0x008 / 4], r[0x00c / 4], r[0x03c / 4], r[0x040 / 4],
+@@ -377,7 +445,7 @@ AppleCLCD::start(IOService *provider)
+ 		fBootStride = fVig0[0x24 / 4];
+ 		fScanPhys = fBootSrc;
+ 		fScanStride = fBootStride;
+-		IOLog("SWEET FB: MDP VIG0 src %#x stride %u (boot), direct scanout ready\n",
++		IOLog("SWEET FB: MDP src %#x stride %u (boot), direct scanout ready\n",
+ 		    fBootSrc, fBootStride);
+ 		sweet_scanout_set_geometry(fWidth, fHeight, fLogicalW, fLogicalH);
+ 		vm_size_t fsz = (vm_size_t)fRowBytes * fHeight;
+@@ -443,9 +511,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+ 	if (fb->fIntf1 != NULL && (count % 300) == 0) {
+-		uint32_t frames = fb->fIntf1[(0x800 + 0x0ac) / 4];
++		uint32_t frames = fb->fIntf1[0x0ac / 4];
+ 		IOLog("SWEET INTF1: %u frames in 5 s (line %u, te_en %#x)\n",
+-		    frames - fb->fIntfFrames, fb->fIntf1[(0x800 + 0x0b0) / 4], fb->fIntf1[0x800 / 4]);
++		    frames - fb->fIntfFrames, fb->fIntf1[0x0b0 / 4], fb->fIntf1[0]);
+ 		fb->fIntfFrames = frames;
+ 	}
+ 	if (fb->fPowerOff) {
+@@ -596,7 +664,8 @@ AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
+ 	fVig0[0x14 / 4] = (uint32_t)pa;
+ 	fVig0[0x24 / 4] = stride;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	fCtl0[0x18 / 4] = 0x20001;      /* flush VIG0 + CTL: latched at the next vsync */
++	/* flush the probed source pipe + CTL: latched at the next vsync */
++	fCtl0[0x18 / 4] = fScanFlushBit | 0x20000;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	fScanPhys = pa;
+ 	fScanStride = stride;

@@ -4,7 +4,7 @@
 
 ### >>> UPDATE 2026-10-25 lena (Xperia 10 III / pdx213): first boot into launchd <<<
 
-**iOS now reaches userspace on lena.** Repo `hasajacyszatan/ios-lena`, branch `lena` (HEAD `abf78fc`).
+**iOS now reaches userspace on lena.** Repo `hasajacyszatan/ios-lena`, branch `lena` (HEAD `5fac59b`, includes the display port 0143).
 Kernel CI: `gh workflow run xnu.yml -R hasajacyszatan/ios-lena --ref lena` (push to `lena` also builds;
 run `40141908236` = kernel with 0140+0141, artifact `xnu-kernel`).
 
@@ -20,6 +20,20 @@ run `40141908236` = kernel with 0140+0141, artifact `xnu-kernel`).
   now the FIRST thing in the loop (no initial sleep) and every 100 ms under `sweetdiag=1`.
   **Reading logs is now `fastboot reboot recovery` -> `tools/sweet-log-pull.sh OUT.txt` (TWRP,
   adb root); no more filming the screen.** Ring is the last 4 MiB+4 KiB of `userdata` (`sda79`).
+- **0142 (commit `0f70ca8`)**: the heartbeat no longer stops at `starting init`; it keeps beating
+  for 10 min tagged `bsd_init`/`userspace` (CI run `40145603961` = OK). A blocked thread can still
+  be told from a dead SoC during launchd.
+- **0143 (commit `5fac59b`), display port - UNTESTED on hardware**: AppleCLCD now programs lena's
+  block: mdss `0xae00000`, SSPP `0xae05000/0xae25000/0xae27000/0xae29000` (`qcom/lagoon-sde.dtsi`:
+  "vig","dma","dma","dma"), CTL `0xae02000..0xae02600`, **DSI0 INTF `0xae06b800`** (not
+  `0xae6b000`), DSI0 ctrl `0xae94000`. It does not trust them blindly: it reads SRC0_ADDR (0x14)
+  and YSTRIDE0 (0x24) of all four pipes and only flips a pipe that already fetches the boot fb
+  (same address and stride); the CTL is the one with non-zero CTL_TOP (0x14); CTL_FLUSH (0x18)
+  gets that pipe's bit + CTL (17) instead of topaz's hardcoded `0x20001`. No match (or
+  `sweetfb_flips=0`) -> `fVig0 = NULL` and `present()` composes into the boot framebuffer, which
+  the panel already scans out: slow, but it cannot blank the panel. DSI (DCS 0x51, panel on/off)
+  and the INTF frame counters are mapped only with `sweetfb_dsi=1`; keep it 0 (ABL leaves the
+  panel in video mode and CMD_MODE_EN is how the topaz port hung).
 - Boot image: `shim/out/shim-boot-lena.img` built by `shim/build-lena.sh` with
   `PATH=~/.local/usr/bin:$PATH LD_LIBRARY_PATH=... DTB=/home/kamil/xperia-backup/boot_unpacked/dtb MKBOOTIMG=mkbootimg`;
   payload = `tools/mkpayload.py <kernel> shim/out/lena.adt shim/out/payload.bin --cmdline "..."`.
@@ -40,10 +54,10 @@ run `40141908236` = kernel with 0140+0141, artifact `xnu-kernel`).
 - **NEXT (in order):** 1) re-run and wait 4-5 min without forcing power-off to decide whether
   `launchd_cache_loader` is a stall or just the ~1 GB dyld cache being read through the polled UFS
   path (consider boot-args `ufswait=1`/`ufscache=1`: with 1 CPU a polling driver monopolises the
-  core); 2) heartbeat must keep running past `starting init` (it currently switches itself off
-  exactly when userspace starts); 3) **port the display** - AppleCLCD: MDP `0xae00000`, DSI0
-  `0xae94000`, INTF `0xaeb0000`, dispcc `0xaf00000` (lena), else iOS can never draw; 4) input
-  (touch over I2C/GENI, keys over SPMI) currently gated by `sweethw=0`; 5) USB/adb would end the
+  core); 2) **test 0143 on the panel** - flash the CI kernel with `sweetfb=1 sweetfb_stayon=1
+  sweetfb_dsi=0 sweetfb_noconsole=1` and read the `SWEET FB: lena pipe .../CTL...` probe lines from
+  the persistent log to learn which pipe really scans out `0xa0000000`; 3) input
+  (touch over I2C/GENI, keys over SPMI) currently gated by `sweethw=0`; 4) USB/adb would end the
   screen-photography era for good (`sweet_usb_probe` still assumes topaz DWC3).
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
