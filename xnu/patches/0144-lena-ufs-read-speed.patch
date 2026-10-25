@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lena <lena@x>
+Date: Sun, 25 Oct 2026 15:10:00 +0200
+Subject: [PATCH] lena-0144: UFS reads without the 1 ms delay tick
+
+The launchd_cache_loader phase looked like a hang: the log stopped there
+and the heartbeat (0142) printed 10/20/30 s and then nothing, while
+launchd went on writing to t = 45 s. It is not a hang.
+
+ufs_scsi() spun on the doorbell with delay(1). A 4 KiB read completes in
+tens of microseconds, so every HFS block cost a full 1 ms tick: 1 GB of
+dyld cache = 262144 reads = 4.5 min of wall clock at best, all of it
+busy-waiting on the only CPU, while the log flush thread waits for the
+same sweet_ufs_lock (hence no more log lines and no more heartbeats).
+
+Poll the doorbell directly instead (the 5 s deadline is still checked on
+every iteration) and print read progress every 32 MiB, so the next boot
+tells "slow" from "stuck" at a glance:
+
+  SWEET UFS: read 64 MiB in 16384 cmds, 87 us/cmd, 11 MiB/s
+
+Slow single commands (> 2 ms, first 20) are logged too.
+---
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 9ec3d1a..1e496b8 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -112,6 +112,12 @@ static struct {
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+ 	bool ready;
++	/* 0144: read progress, so a slow dyld-cache load is not mistaken for a hang */
++	uint64_t reads;                         /* commands */
++	uint64_t read_kib;
++	uint64_t read_ns;                       /* time spent waiting for completion */
++	uint32_t slow_logs;
++	uint64_t next_report;                   /* read_kib threshold of the next progress line */
+ } su;
+ 
+ static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
+@@ -204,10 +210,11 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	}
+ 	__builtin_arm_dsb(0xf);
+ 
++	uint64_t start = mach_absolute_time();
+ 	ufs_wr(REG_UTRLDBR, 1);
+ 	uint64_t deadline;
+ 	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+-	deadline += mach_absolute_time();
++	deadline += start;
+ 	bool sleepable = su.wait && su.ready && ml_get_interrupts_enabled() &&
+ 	    !ml_at_interrupt_context() && get_preemption_level() == 0;
+ 	uint64_t spin_until = 0, sleep_interval = 0;
+@@ -230,12 +237,30 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 			    TIMEOUT_URGENCY_SYS_CRITICAL, wake, 0) == THREAD_WAITING) {
+ 				thread_block(THREAD_CONTINUE_NULL);
+ 			}
+-		} else {
+-			delay(1);
+ 		}
++		/*
++		 * 0144: no delay() here. A 4 KiB read completes in tens of
++		 * microseconds, but delay(1) rounded every command up to a 1 ms
++		 * tick: the dyld cache (1 GB of 4 KiB HFS block reads) then took
++		 * tens of minutes and the poll loop hogged the CPU throughout.
++		 * Busy-poll the doorbell; the deadline is still checked above.
++		 */
+ 	}
+ 	__builtin_arm_dsb(0xf);
+ 	ufs_wr(REG_IS, ufs_rd(REG_IS));         /* acknowledge completion status */
++	if (len && !write) {
++		uint64_t el_ns;
++
++		absolutetime_to_nanoseconds(mach_absolute_time() - start, &el_ns);
++		su.reads++;
++		su.read_kib += len >> 10;
++		su.read_ns += el_ns;
++		if (el_ns > 2ull * NSEC_PER_MSEC && su.slow_logs < 20) {
++			su.slow_logs++;
++			printf("SWEET UFS: slow read 0x%02x %u B: %llu us\n",
++			    cdb[0], len, el_ns / NSEC_PER_USEC);
++		}
++	}
+ 
+ 	dma_sync(DMA_UTRL, sizeof(*utrd));
+ 	if (su.cache) {
+@@ -560,6 +585,22 @@ sweet_ufs_strategy(buf_t bp)
+ 		done += want;
+ 		buf_setresid(bp, count - done);
+ 	}
++	/*
++	 * 0144: a progress line every 32 MiB of reads. The dyld cache load reads
++	 * about 1 GB through this path; without these lines a slow load looks
++	 * exactly like a hang (the log flush thread competes for the same mutex).
++	 */
++	if (rd && su.read_kib >= su.next_report) {
++		uint64_t mib_s = 0;
++
++		su.next_report = su.read_kib + (32ull << 10);
++		if (su.read_ns) {
++			mib_s = su.read_kib * (NSEC_PER_SEC / (1ull << 10)) / su.read_ns;
++		}
++		printf("SWEET UFS: read %llu MiB in %llu cmds, %llu us/cmd, %llu MiB/s\n",
++		    su.read_kib >> 10, su.reads,
++		    su.reads ? (su.read_ns / su.reads) / NSEC_PER_USEC : 0, mib_s);
++	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	buf_unmap(bp);
+ 

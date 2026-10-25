@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lena <lena@x>
+Date: Sun, 25 Oct 2026 15:20:00 +0200
+Subject: [PATCH] lena-0145: MDP flips off by default
+
+First boot with 0143 and sweetfb=1: the probe is right (VIG0 fetches
+0xa0000000/4320, CTL0 has a mixer bound), but as soon as AppleCLCD takes
+the console over the panel stops updating - the visible log freezes a few
+lines after "Firehose configured" and never shows anything newer, with
+cpus=1 and cpus=4 alike. With sweetfb_flips=0 the console keeps painting
+(seen through "exec tzinit") and the panel stays in sync.
+
+So keep the safe path the default: compose into the boot framebuffer,
+which the panel already scans out, and make the MDP flip path opt-in with
+sweetfb_flips=1 until its flush/latch behaviour is understood.
+---
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -353,7 +353,7 @@
+ 		if (fVig0 == NULL && src == (uint32_t)fPhys && stride == fRowBytes) {
+ 			fVig0 = p;
+ 			fScanFlushBit = pipeFlush[i];
+-			IOLog("SWEET FB: lena scanout pipe is %s, flips enabled\n", pipeName[i]);
++			IOLog("SWEET FB: lena scanout pipe is %s\n", pipeName[i]);
+ 		}
+ 	}
+ 	if (fVig0 != NULL) {
+@@ -379,14 +379,16 @@
+ 		IOLog("SWEET FB: lena no pipe scans out the boot fb, composing into it\n");
+ 	}
+ 	if (fVig0 != NULL) {
+-		uint32_t flips = 1;
++		uint32_t flips = 0;
+ 
+ 		(void)PE_parse_boot_argn("sweetfb_flips", &flips, sizeof(flips));
+ 		if (!flips) {
+-			IOLog("SWEET FB: lena flips disabled by sweetfb_flips=0, composing into the boot fb\n");
++			IOLog("SWEET FB: composing into the boot fb (flips off; sweetfb_flips=1 enables MDP flips)\n");
+ 			fVig0 = NULL;
+ 			fCtl0 = NULL;
+ 			fScanFlushBit = 0;
++		} else {
++			IOLog("SWEET FB: flips enabled by sweetfb_flips=1\n");
+ 		}
+ 	}
+ 	fDsi = dsiOn ? (volatile uint8_t *)ml_io_map(0x0ae94000, 0x1000) : NULL;

@@ -4,7 +4,7 @@
 
 ### >>> UPDATE 2026-10-25 lena (Xperia 10 III / pdx213): first boot into launchd <<<
 
-**iOS now reaches userspace on lena.** Repo `hasajacyszatan/ios-lena`, branch `lena` (HEAD `5fac59b`, includes the display port 0143).
+**iOS now reaches userspace on lena.** Repo `hasajacyszatan/ios-lena`, branch `lena` (HEAD `ce17ce5` + 0144/0145).
 Kernel CI: `gh workflow run xnu.yml -R hasajacyszatan/ios-lena --ref lena` (push to `lena` also builds;
 run `40141908236` = kernel with 0140+0141, artifact `xnu-kernel`).
 
@@ -23,7 +23,7 @@ run `40141908236` = kernel with 0140+0141, artifact `xnu-kernel`).
 - **0142 (commit `0f70ca8`)**: the heartbeat no longer stops at `starting init`; it keeps beating
   for 10 min tagged `bsd_init`/`userspace` (CI run `40145603961` = OK). A blocked thread can still
   be told from a dead SoC during launchd.
-- **0143 (commit `5fac59b`), display port - UNTESTED on hardware**: AppleCLCD now programs lena's
+- **0143 (commit `ce17ce5`), display port - TESTED on hardware, probe hits**: AppleCLCD now programs lena's
   block: mdss `0xae00000`, SSPP `0xae05000/0xae25000/0xae27000/0xae29000` (`qcom/lagoon-sde.dtsi`:
   "vig","dma","dma","dma"), CTL `0xae02000..0xae02600`, **DSI0 INTF `0xae06b800`** (not
   `0xae6b000`), DSI0 ctrl `0xae94000`. It does not trust them blindly: it reads SRC0_ADDR (0x14)
@@ -34,12 +34,29 @@ run `40141908236` = kernel with 0140+0141, artifact `xnu-kernel`).
   the panel already scans out: slow, but it cannot blank the panel. DSI (DCS 0x51, panel on/off)
   and the INTF frame counters are mapped only with `sweetfb_dsi=1`; keep it 0 (ABL leaves the
   panel in video mode and CMD_MODE_EN is how the topaz port hung).
+  **Measured (log `/tmp/opencode/log0143a.txt`, cpus=4): `lena pipe VIG0 src 0xa0000000 stride 4320
+  (boot fb 0xa0000000/4320)` -> scanout pipe is VIG0; DMA0..2 src 0; `CTL0 top 0x20000`.** So the
+  panel really scans out `0xa0000000` through VIG0 + CTL0 and the addresses in 0143 are right.
+  **But flips=1 freezes the panel:** with `sweetfb=1` (flips on) the visible log stops a few lines
+  after "Firehose configured" and never advances, at cpus=1 and cpus=4 alike, while the kernel keeps
+  running (0142 heartbeat 10/20/30 s, log flush to t=45 s). With `sweetfb_flips=0` the screen shows
+  `exec tzinit` (log `/tmp/opencode/log0143b.txt`). So the working path is compose-into-boot-fb.
+- **0144 (UFS read speed)**: `ufs_scsi()` polled the doorbell with `delay(1)`, i.e. a 1 ms tick per
+  command: ~4.5 min per GB of dyld cache, all of it busy-waiting on the only CPU, while the log
+  flush thread blocks on the same `sweet_ufs_lock` (that is why heartbeats and log lines stop at
+  ~30 s). Now a tight doorbell poll (deadline still checked) + `SWEET UFS: read N MiB in M cmds,
+  X us/cmd, Y MiB/s` every 32 MiB + slow-command (>2 ms, first 20) logs. `ufswait=1` still exists.
+- **0145 (flips off by default)**: `sweetfb_flips` default is now 0 (compose into boot fb);
+  `sweetfb_flips=1` opts into the MDP flip path.
+- Cmdline used for the working boot: `debug=0x14 serial=3 cpus=1 keepsyms=1 -v -noprogress rd=ufsroot0
+  ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin wdt=-1
+  sweethw=0 sweetcpufreq=0 sweetbattery=0 sweetfb=1 sweetfb_stayon=1 sweetfb_dsi=0
+  sweetfb_noconsole=1 sweetdiag=1 launchd_unsecure_cache=1`.
 - Boot image: `shim/out/shim-boot-lena.img` built by `shim/build-lena.sh` with
   `PATH=~/.local/usr/bin:$PATH LD_LIBRARY_PATH=... DTB=/home/kamil/xperia-backup/boot_unpacked/dtb MKBOOTIMG=mkbootimg`;
   payload = `tools/mkpayload.py <kernel> shim/out/lena.adt shim/out/payload.bin --cmdline "..."`.
   Flash with **`fastboot flash boot_b <img>`** (`fastboot boot` = `remote: 'unknown command'` on this
-  device), slot b active. Cmdline now: `... sweethw=0 sweetcpufreq=0 sweetbattery=0 sweetfb=0
-  sweetfb_noconsole=1 sweetdiag=1 launchd_unsecure_cache=1`.
+  device), slot b active.
 - **Frozen-boot root causes, both fixed by boot-args (no code change needed):**
   `SweetBattery::start()` -> `sweet_i2c1_init()` programmed topaz GCC `0x1400000`/TLMM `0x500000`
   (hangs the SoC) -> `sweetbattery=0`; AppleCLCD topaz MDP/DSI -> `sweetfb=0`.
@@ -51,13 +68,15 @@ run `40141908236` = kernel with 0140+0141, artifact `xnu-kernel`).
   sysstatuscheck, prng_seedctl -> **stops at `exec launchd_cache_loader`** (t = 45 s of launchd's
   1970 clock). Cosmetic-only errors there: data volume missing, BindFS /private/preboot, tzinit,
   prng seed - expected on this image.
-- **NEXT (in order):** 1) re-run and wait 4-5 min without forcing power-off to decide whether
-  `launchd_cache_loader` is a stall or just the ~1 GB dyld cache being read through the polled UFS
-  path (consider boot-args `ufswait=1`/`ufscache=1`: with 1 CPU a polling driver monopolises the
-  core); 2) **test 0143 on the panel** - flash the CI kernel with `sweetfb=1 sweetfb_stayon=1
-  sweetfb_dsi=0 sweetfb_noconsole=1` and read the `SWEET FB: lena pipe .../CTL...` probe lines from
-  the persistent log to learn which pipe really scans out `0xa0000000`; 3) input
-  (touch over I2C/GENI, keys over SPMI) currently gated by `sweethw=0`; 4) USB/adb would end the
+- **NEXT (in order):** 1) boot 0144+0145 with `cpus=4 sweetfb_flips=0` and **wait >= 5 min without
+  power-off**: `SWEET UFS: read ... MiB/s` lines decide whether `launchd_cache_loader` was only slow
+  reading, and heartbeats past 30 s prove the log flush is no longer starved (cpus=4 is expected to
+  be fine now - the earlier "cpus=4 wedge after usermanagerd" was the same UFS starvation, the screen
+  freeze was flips=1); 2) if the boot gets past the dyld cache, watch `backboardd`/SpringBoard and
+  the first `present()` into the boot fb (screen should show the Apple logo/UI, no MDP flips needed);
+  3) understand the flips=1 freeze (CTL_FLUSH/latch vs ABL's already-running CTL, maybe a missing
+  CTL_TOP/INTF trigger select or double-buffered SRC0/SPLIT_PIPE); 4) input
+  (touch over I2C/GENI, keys over SPMI) currently gated by `sweethw=0`; 5) USB/adb would end the
   screen-photography era for good (`sweet_usb_probe` still assumes topaz DWC3).
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
