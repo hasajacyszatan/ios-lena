@@ -4,7 +4,7 @@
 
 ### >>> UPDATE 2026-10-25 lena (Xperia 10 III / pdx213): first boot into launchd <<<
 
-**iOS now reaches userspace on lena.** Repo `hasajacyszatan/ios-lena`, branch `lena` (HEAD `2f45580` = 0140..0153).
+**iOS now reaches userspace on lena.** Repo `hasajacyszatan/ios-lena`, branch `lena` (HEAD = 0140..0156).
 Kernel CI: `gh workflow run xnu.yml -R hasajacyszatan/ios-lena --ref lena` (push to `lena` also builds;
 run `40141908236` = kernel with 0140+0141, artifact `xnu-kernel`).
 
@@ -126,6 +126,34 @@ run `40141908236` = kernel with 0140+0141, artifact `xnu-kernel`).
   drop it, then `proc_find(pid)` (it also asserts NOTOWNED on the list lock) and take `p_mlock`
   per process, `proc_rele()` after. USB is off the critical path: no `sweetusb*` boot-args
   (`sweetusb=1 sweetusb_hw=2` was the first boot of 0150 and the first one that reset itself).
+- **0154 (`4c33031`) + 0155 (`d97ae93`), dump detail and a panic flush that actually runs.**
+  The dump now prints `pid ppid state flags nthreads name @wchan` per process (that is all the
+  0151-style panic needs: the panic itself is *our* dump, not launchd). 0155: `sweet_early_panic()`
+  returned immediately because it was gated on `early_disabled`, which `arm_init` sets long before
+  userspace, so 0151's ring copy never ran for a real panic; only the framebuffer copy needs that
+  gate now, the ring always gets `SWEET PANIC: caller 0x...: <text>`, and the debugger flushes
+  again right after printing `panic(cpu N caller ...)`.
+- **0155 boot (ring pulled: `/tmp/opencode/log0155.txt.bin`) - the 10 s self-reboot is gone; the
+  boot now sits idle instead of dying.** Heartbeats run to 600 s with `reads=1517 93MiB` frozen,
+  the ring is 64 KiB (no wrap), and the last line before the silence is `exec launchd_cache_loader`.
+  Note where that line comes from: `bsd/kern/kern_exec.c:7416`, inside `process_signature()`,
+  i.e. **after** the image was loaded and `exec_mach_imgact()` returned - the hang is in the tail
+  of `posix_spawn()`, not in exec itself. The log also showed **zero `SWEET PS` lines in 600 s**
+  while the heartbeat printed every second, so the dump thread was parked (list lock or `p_mlock`).
+- **Ring flush bug found from that pull.** `sweet_log_flush_locked()` advances `pos` to a block
+  boundary, so after a flush `sweet_log_flushed` can be up to a block *past* `total`. The next
+  flush computed `total - flushed`, wrapped to ~2^64, decided "reader is a ring behind" and set
+  `pos = total - 4 MiB`, skipping the data copy and storing that impossible position as the header
+  total (`18446744073705393439` = 36127 - 4 MiB). Fix (0156): clamp both the recovered and the
+  final position to `total`; this also removes the 1.7 KiB hole where a partially filled block was
+  persisted once and never rewritten (33 heartbeats of the 0155 boot were lost that way).
+- **0156 (`xnu/patches/0156-lena-spawn-markers-lock-holder.patch`): make the next boot name the
+  stuck call.** `SWEET SPAWN/EXEC/SIG` markers around `exec_activate_image`, `exec_mach_imgact`,
+  `process_signature` (CS_SIGNED decision, task access port, the taskgated upcall) and the
+  `task_terminate_internal()` of the old task; the dump uses `lck_mtx_try_lock()` and reports the
+  holder instead of blocking; `proc_list_lock()` records holder thread/pid/caller-return-address
+  and time, and prints a `SWEET LOCK:` line once a second when a waiter blocks. `msleep()` over
+  that mutex bypasses the bookkeeping, so the recorded holder is advisory.
 - Cmdline used for the working boot: `debug=0x14 serial=3 cpus=1 keepsyms=1 -v -noprogress rd=ufsroot0
   ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin wdt=-1
   sweethw=0 sweetcpufreq=0 sweetbattery=0 sweetfb=1 sweetfb_stayon=1 sweetfb_dsi=0

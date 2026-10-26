@@ -1,0 +1,433 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lena <lena@x>
+Date: Tue, 27 Oct 2026 01:10:00 +0100
+Subject: [PATCH] lena-0156: show where the spawn stalls, name the lock holder
+
+The 0155 boot stops printing right after
+
+    exec launchd_cache_loader
+
+and then sits idle for the whole 600 s of heartbeats: no UFS command, no
+process dump, no panic. That line is printed by process_signature(), which
+runs *after* the image is loaded, at the end of posix_spawn() - so the hang
+is in the signature/spawn tail, not in the exec itself.
+
+Three things now make the next boot answer it:
+
+1. Spawn/exec markers: SWEET SPAWN/EXEC/SIG lines around exec_activate_image,
+   exec_mach_imgact (entry, load_machfile, vm_map_exec, done),
+   process_signature (CS_SIGNED decision, task access port, the taskgated
+   upcall) and the task_terminate_internal() of the old task. The last marker
+   of the next log names the call that never returns.
+
+2. The process dump no longer blocks. 0155 produced not one SWEET PS line in
+   600 s while the heartbeat kept printing, which means the dump thread was
+   parked - most likely in proc_list_lock() or in a process's p_mlock. It now
+   uses lck_mtx_try_lock(): on failure it prints who holds the lock and skips
+   the round, and prints "dump N start" before every walk so a walk that
+   begins and never ends is visible.
+
+3. proc_list_lock() records its holder (thread, pid, caller return address,
+   acquisition time) and complains once a second when a waiter has to block
+   that long. The holder's site address can be symbolized offline. msleep()
+   over the same mutex bypasses the bookkeeping, so the recorded holder is
+   advisory, not gospel.
+
+Also fixes the ring flush position: it is advanced to a block boundary, so
+after a flush it can be up to one block past `total`; the next flush computed
+total - flushed, wrapped to ~2^64, and set pos = total - 4 MiB - an impossible
+position that skipped the data copy and stored that value as the advertised
+total (the 0155 pull read total = 18446744073705393439 = 36127 - 4 MiB). Both
+positions are now clamped to `total`, which also removes the ~1.7 KiB hole
+where a partially filled block was persisted once and never rewritten (33
+heartbeats of the 0155 boot were lost that way).
+---
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1032,11 +1032,32 @@
+ {
+ 	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
+ 	uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
+-	uint64_t pos = total - sweet_log_flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : sweet_log_flushed;
++	uint64_t flushed = sweet_log_flushed;
++	uint64_t pos;
+ 	void *bounce = (void *)(su.dma + DMA_BOUNCE);
+ 	int error = 0;
+ 	int cmds = 0;
+ 
++	/*
++	 * 0156: the copy below moves `pos` to a block boundary, so after a flush
++	 * `sweet_log_flushed` can sit up to one block past `total`. The next
++	 * flush then evaluated total - flushed, which wrapped to ~2^64, counted
++	 * as "the reader fell more than a ring behind", and set
++	 *
++	 *     pos = total - SWEET_LOG_SIZE
++	 *
++	 * - an address before the beginning of the ring. `pos < total` is then
++	 * false for a while, so the data copy is skipped and only the header is
++	 * rewritten, storing that impossible position as the advertised total:
++	 * the 0155 pull read `total = 18446744073705393439` = 36127 - 4 MiB,
++	 * i.e. the persisted log appeared to end 4 MiB before it started, and
++	 * every later pull lost the newest lines. Recover instead of wrapping.
++	 */
++	if (flushed > total) {
++		flushed = total > SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : 0;
++	}
++	pos = total - flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : flushed;
++
+ 	while (pos < total && !error) {
+ 		uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
+ 		uint32_t blk = off / UFS_BLOCK;
+@@ -1051,6 +1072,14 @@
+ 			break;
+ 		}
+ 	}
++	/*
++	 * 0156: never advertise or remember bytes past the end of the console
++	 * data. A block-rounded position past `total` is exactly what set up the
++	 * wrap described above, so clamp it back to the truth here as well.
++	 */
++	if (pos > total) {
++		pos = total;
++	}
+ 	if (!error) {
+ 		struct sweet_log_header h = {
+ 			.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -533,6 +533,16 @@
+  */
+ extern unsigned int vm_page_free_count;
+ 
++/*
++ * 0156: the proc_list_lock() bookkeeping from bsd/kern/kern_fork.c, so a
++ * skipped dump can name the thread that owns the lock instead of just saying
++ * "busy".
++ */
++extern void *sweet_plock_holder;
++extern int sweet_plock_holder_pid;
++extern uintptr_t sweet_plock_site;
++extern uint64_t sweet_plock_held_since;
++
+ #define SWEET_PS_MAX 192
+ 
+ /*
+@@ -560,7 +570,30 @@
+ 	int n = 0;
+ 	int i;
+ 
+-	proc_list_lock();
++	/*
++	 * 0156: never block on the list lock. A dump thread parked on it is
++	 * silent by definition - the 0155 boot printed not one SWEET PS line in
++	 * 600 s while the heartbeat kept printing - and "the list lock is stuck
++	 * in this thread" is itself the answer, so report the holder and skip
++	 * this round.
++	 */
++	if (!lck_mtx_try_lock(&proc_list_mlock)) {
++		uint64_t held_ms = 0;
++
++		if (sweet_plock_holder != NULL && sweet_plock_held_since != 0) {
++			uint64_t ns = 0;
++
++			absolutetime_to_nanoseconds(mach_absolute_time() -
++			    sweet_plock_held_since, &ns);
++			held_ms = ns / NSEC_PER_MSEC;
++		}
++		printf("SWEET PS: proc_list_mlock busy, dump skipped: holder pid %d thread 0x%llx site 0x%llx held %llu ms, state 0x%08x\n",
++		    sweet_plock_holder_pid,
++		    (uint64_t)(uintptr_t)sweet_plock_holder,
++		    (uint64_t)sweet_plock_site, held_ms,
++		    proc_list_mlock.lck_mtx.data);
++		return;
++	}
+ 	for (p = allproc.lh_first; p != NULL && n < SWEET_PS_MAX;
+ 	    p = p->p_list.le_next) {
+ 		pids[n++] = p->p_pid;
+@@ -574,7 +607,17 @@
+ 		if ((p = proc_find(pids[i])) == NULL) {
+ 			continue;
+ 		}
+-		proc_lock(p);
++		/*
++		 * 0156: same rule for p_mlock - try, report, skip. Waiting here
++		 * would hide the one process whose lock is stuck, which is
++		 * precisely the interesting one.
++		 */
++		if (!lck_mtx_try_lock(&p->p_mlock)) {
++			printf("SWEET PS: %5d p_mlock busy, skipped (state 0x%08x)\n",
++			    (int)p->p_pid, p->p_mlock.lck_mtx.data);
++			proc_rele(p);
++			continue;
++		}
+ 		/* 0154: also show the parent, the P_* flags and the thread count -
+ 		 * one boot should be enough to tell "never started" (absent),
+ 		 * "stuck in exec" (P_WEXIT/P_EXEC) and "blocked" (wchan) apart. */
+@@ -602,6 +645,7 @@
+ {
+ 	int period = 5000;                      /* boot-arg sweetps_ms */
+ 	bool announced = FALSE;
++	uint32_t dumps = 0;
+ 
+ 	PE_parse_boot_argn("sweetps_ms", &period, sizeof(period));
+ 	if (period < 500) {
+@@ -628,6 +672,13 @@
+ 			announced = TRUE;
+ 			printf("SWEET PS: process dump every %d ms (pid state name @wchan)\n", period);
+ 		}
++		/*
++		 * 0156: a start line before every dump, paired with the
++		 * "N processes" trailer. If a dump begins and never ends, the
++		 * next boot's log says that the stuck call is between the two,
++		 * even when nothing inside the walk printed anything.
++		 */
++		printf("SWEET PS: dump %u start\n", ++dumps);
+ 		sweet_diag_procs();
+ 	}
+ }
+--- a/bsd/kern/kern_fork.c
++++ b/bsd/kern/kern_fork.c
+@@ -118,6 +118,10 @@
+ #include <security/audit/audit.h>
+ 
+ #include <mach/mach_types.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <kern/clock.h>                 /* 0156: mach_absolute_time() for the lock report */
++#endif
+ #include <kern/coalition.h>
+ #include <kern/kern_types.h>
+ #include <kern/kalloc.h>
+@@ -1235,6 +1239,72 @@
+ 	lck_spin_unlock(&p->p_slock);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 0156: who holds proc_list_mlock, and from where.
++ *
++ * In the 0155 boot the process-dump thread printed not one line in 600 s
++ * while the heartbeat thread kept printing, and the machine went idle right
++ * after `exec launchd_cache_loader`. A thread parked on a mutex is invisible
++ * from inside the kernel, so the lock has to say who took it: record the
++ * holder's thread, pid, the return address of the proc_list_lock() caller and
++ * the acquisition time, and have the dump thread print them when it cannot
++ * get the lock. Also complain once a second if a waiter has to block that
++ * long, which is already pathological (the lock is only held for short walks).
++ */
++void *sweet_plock_holder;               /* struct thread * */
++int sweet_plock_holder_pid = -1;
++uintptr_t sweet_plock_site;
++uint64_t sweet_plock_held_since;        /* mach absolute time, 0 = free */
++static uint64_t sweet_plock_last_report;
++
++extern struct proc *current_proc(void);
++
++void
++proc_list_lock(void)
++{
++	uint64_t now = mach_absolute_time();
++
++	if (!lck_mtx_try_lock(&proc_list_mlock)) {
++		uint64_t since_report_ns = NSEC_PER_SEC;
++
++		if (sweet_plock_last_report != 0) {
++			absolutetime_to_nanoseconds(now - sweet_plock_last_report,
++			    &since_report_ns);
++		}
++		if (since_report_ns >= NSEC_PER_SEC) {
++			uint64_t held_ns = 0;
++
++			sweet_plock_last_report = now;
++			if (sweet_plock_holder != NULL && sweet_plock_held_since != 0) {
++				absolutetime_to_nanoseconds(now - sweet_plock_held_since,
++				    &held_ns);
++			}
++			printf("SWEET LOCK: proc_list_mlock busy: waiter 0x%llx, holder pid %d thread 0x%llx site 0x%llx held %llu ms, state 0x%08x\n",
++			    (uint64_t)(uintptr_t)__builtin_return_address(0),
++			    sweet_plock_holder_pid,
++			    (uint64_t)(uintptr_t)sweet_plock_holder,
++			    (uint64_t)sweet_plock_site, held_ns / NSEC_PER_MSEC,
++			    proc_list_mlock.lck_mtx.data);
++		}
++		lck_mtx_lock(&proc_list_mlock);
++	}
++	sweet_plock_holder = current_thread();
++	sweet_plock_holder_pid = current_proc() != NULL ? proc_pid(current_proc()) : -1;
++	sweet_plock_site = (uintptr_t)__builtin_return_address(0);
++	sweet_plock_held_since = mach_absolute_time();
++}
++
++void
++proc_list_unlock(void)
++{
++	sweet_plock_holder = NULL;
++	sweet_plock_holder_pid = -1;
++	sweet_plock_site = 0;
++	sweet_plock_held_since = 0;
++	lck_mtx_unlock(&proc_list_mlock);
++}
++#else /* !ARM64_BOARD_CONFIG_SWEET */
+ void
+ proc_list_lock(void)
+ {
+@@ -1246,6 +1316,7 @@
+ {
+ 	lck_mtx_unlock(&proc_list_mlock);
+ }
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ void
+ proc_ucred_lock(proc_t p)
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -1179,6 +1179,12 @@
+ 	boolean_t               reslide = FALSE;
+ 	char *                  userspace_coredump_name = NULL;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* 0156: spawn/exec timeline. Only a handful of lines per process. */
++	printf("SWEET EXEC: pid %d spawn %d thread 0x%llx start %s\n", proc_pid(p),
++	    spawn, (uint64_t)(uintptr_t)current_thread(), p->p_name);
++#endif
++
+ 	/*
+ 	 * make sure it's a Mach-O 1.0 or Mach-O 2.0 binary; the difference
+ 	 * is a reserved field on the end, so for the most part, we can
+@@ -1315,6 +1321,9 @@
+ 	 * Actually load the image file we previously decided to load.
+ 	 */
+ 	lret = load_machfile(imgp, mach_header, thread, &map, &load_result);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	printf("SWEET EXEC: pid %d load_machfile -> %d\n", proc_pid(p), lret);
++#endif
+ 	if (lret != LOAD_SUCCESS) {
+ 		error = load_return_to_errno(lret);
+ 
+@@ -1569,6 +1578,10 @@
+ 	    (void *)p->p_fd.fd_rdir, cputype, cpu_subtype, reslide,
+ 	    (imgp->ip_flags & IMGPF_DRIVER) != 0,
+ 	    rsr_version);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	printf("SWEET EXEC: pid %d vm_map_exec ok map 0x%llx\n", proc_pid(p),
++	    (uint64_t)(uintptr_t)map);
++#endif
+ 
+ 	/*
+ 	 * Close file descriptors which specify close-on-exec.
+@@ -2068,6 +2081,9 @@
+ 	}
+ 
+ done:
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	printf("SWEET EXEC: pid %d done error %d\n", proc_pid(p), error);
++#endif
+ 	if (load_result.threadstate) {
+ 		kfree_data(load_result.threadstate, load_result.threadstate_sz);
+ 		load_result.threadstate = NULL;
+@@ -4054,7 +4070,16 @@
+ 	 * Warning: If activation failed after point of no return, it returns error
+ 	 * as 0 and pretends the call succeeded.
+ 	 */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* 0156: the last line the 0155 boot printed comes from process_signature()
++	 * inside this call. Bracket the spawn steps so the next log shows which
++	 * one never returns. */
++	printf("SWEET SPAWN: pid %d start %s\n", proc_pid(p), p->p_name);
++#endif
+ 	error = exec_activate_image(imgp);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	printf("SWEET SPAWN: pid %d exec_activate_image -> %d\n", proc_pid(p), error);
++#endif
+ #if defined(HAS_APPLE_PAC)
+ 	ml_task_set_jop_pid_from_shared_region(new_task);
+ 	ml_task_set_disable_user_jop(new_task, imgp->ip_flags & IMGPF_NOJOP ? TRUE : FALSE);
+@@ -4455,7 +4480,13 @@
+ 	 * fire.
+ 	 */
+ 	if (error == 0) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		printf("SWEET SPAWN: pid %d process_signature start\n", proc_pid(p));
++#endif
+ 		error = process_signature(p, imgp);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		printf("SWEET SPAWN: pid %d process_signature -> %d\n", proc_pid(p), error);
++#endif
+ 
+ 		/*
+ 		 * Pay for our earlier safety; deliver the delayed signals from
+@@ -4637,9 +4668,19 @@
+ 	 * switch the tasks, terminating the current task without the switch would
+ 	 * result in loosing the SIGKILL status.
+ 	 */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	printf("SWEET SPAWN: pid %d task_did_exec %d\n", proc_pid(p),
++	    task_did_exec(old_task) ? 1 : 0);
++#endif
+ 	if (task_did_exec(old_task)) {
+ 		/* Terminate the current task, since exec will start in new task */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		printf("SWEET SPAWN: pid %d terminating the old task\n", proc_pid(p));
++#endif
+ 		task_terminate_internal(old_task);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		printf("SWEET SPAWN: pid %d old task terminated\n", proc_pid(p));
++#endif
+ 	}
+ 
+ 	/* Release the thread ref returned by cloneproc/fork1 */
+@@ -4656,6 +4697,9 @@
+ 		new_task = NULL;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	printf("SWEET SPAWN: pid %d returning error %d\n", proc_pid(p), error);
++#endif
+ 	if (should_release_proc_ref) {
+ 		proc_rele(p);
+ 	}
+@@ -7434,6 +7478,13 @@
+ 
+ 	/* If the code signature came through the image activation path, we skip the
+ 	 * taskgated / externally attached path. */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* 0156: "exec <name>" above is the last line of the 0155 boot, so print
++	 * what the signature path decides next: whether it skips taskgated, and
++	 * if not, whether the upcall to taskgated ever returns. */
++	printf("SWEET SIG: pid %d csflags 0x%08x signed %d\n", proc_getpid(p),
++	    (unsigned)imgp->ip_csflags, (imgp->ip_csflags & CS_SIGNED) ? 1 : 0);
++#endif
+ 	if (imgp->ip_csflags & CS_SIGNED) {
+ 		error = 0;
+ 		goto done;
+@@ -7444,6 +7495,10 @@
+ 	 * path), or that will now be attached by taskgated. */
+ 
+ 	kr = task_get_task_access_port(proc_task(p), &port);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	printf("SWEET SIG: pid %d task_access_port -> %d port 0x%x\n", proc_getpid(p),
++	    kr, port);
++#endif
+ 	if (KERN_SUCCESS != kr || !IPC_PORT_VALID(port)) {
+ 		error = 0;
+ 		if (require_success) {
+@@ -7464,6 +7519,9 @@
+ 	 */
+ 
+ 	kr = __EXEC_WAITING_ON_TASKGATED_CODE_SIGNATURE_UPCALL__(port, proc_getpid(p));
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	printf("SWEET SIG: pid %d taskgated upcall -> %d\n", proc_getpid(p), kr);
++#endif
+ 	switch (kr) {
+ 	case KERN_SUCCESS:
+ 		error = 0;
+@@ -7525,6 +7583,9 @@
+ 	}
+ 
+ done:
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	printf("SWEET SIG: pid %d done error %d\n", proc_getpid(p), error);
++#endif
+ 	if (0 == error) {
+ 		/*
+ 		 * Update the new process's signature-dependent process state.
