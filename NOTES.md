@@ -4,7 +4,7 @@
 
 ### >>> UPDATE 2026-10-25 lena (Xperia 10 III / pdx213): first boot into launchd <<<
 
-**iOS now reaches userspace on lena.** Repo `hasajacyszatan/ios-lena`, branch `lena` (HEAD `ce17ce5` + 0144/0145).
+**iOS now reaches userspace on lena.** Repo `hasajacyszatan/ios-lena`, branch `lena` (HEAD `2f45580` = 0140..0153).
 Kernel CI: `gh workflow run xnu.yml -R hasajacyszatan/ios-lena --ref lena` (push to `lena` also builds;
 run `40141908236` = kernel with 0140+0141, artifact `xnu-kernel`).
 
@@ -48,6 +48,84 @@ run `40141908236` = kernel with 0140+0141, artifact `xnu-kernel`).
   X us/cmd, Y MiB/s` every 32 MiB + slow-command (>2 ms, first 20) logs. `ufswait=1` still exists.
 - **0145 (flips off by default)**: `sweetfb_flips` default is now 0 (compose into boot fb);
   `sweetfb_flips=1` opts into the MDP flip path.
+- **0145 TESTED on hardware (log `/tmp/opencode/log0144.txt`, 485 lines, flush #25, `cpus=4`,
+  flips off):** UFS reads now `53 -> 186 -> 218 MiB/s` (was ~4 MB/s with `delay(1)`), progress line
+  every 32 MiB, heartbeats survive past 30 s to `alive 60 s`, and the boot reaches
+  `exec launchd_cache_loader` with 64 MiB read. But there the panel console AND the persisted ring
+  stopped together - looked like a kernel stop, which 0147 disproved.
+- **0146 (in `375ed13`), flips flush + panel dump**: `CTL_FLUSH = 0xffffffff` (flush every bit; a
+  flush bit for an idle block is a no-op, so it cannot push stale state, but it guarantees the new
+  `SSPP_SRC0_ADDR` latches - 0143's guessed VIG0 bit never did), CTL0 always (its `CTL_TOP` reads
+  `0x20000`, not a mixer mask; DTB `qcom,sde-ctl-display-pref = primary,none,none,none`), logs all
+  four CTL `TOP/LAYER_0/FLUSH/START` and dumps CTL0/MIXER0/PP0/INTF1. Only matters for the future
+  `sweetfb_flips=1` test; with flips off it adds log lines only.
+- **0147 (in `375ed13`) TESTED on hardware (log `/tmp/opencode/log0147.txt`, 1099 lines, flush #621,
+  `cpus=4`, CI `40202351994`) - THE WALL IS NOT THE UFS DRIVER AND NOT A DEAD KERNEL.** Heartbeat
+  every second (`sweethb_ms`, default 1000) printed `SWEET HB: alive N.Ns reads=<cmds> <MiB>` to
+  **546+ s**, the ring kept flushing (flush #621 vs #25 before), there was **no `still waiting`, no
+  `timed out`, no `flush blocked`** - i.e. no UFS command in flight and `sweet_ufs_lock` free the
+  whole time. The read counters froze at **1517 cmds / 93 MiB between HB 32 s and 33 s**, right
+  after `exec launchd_cache_loader`, which is the last non-heartbeat line in the log. Conclusion:
+  after that exec **nothing issues reads any more** - the stall is a process blocked outside the UFS
+  driver (or a process that never started). The user's screen is fully covered by HB lines
+  (`alive 546.0s reads 1517 93MiB (userspace)`).
+- **0148 (in `3e5c0a6`), process dump with wait channels**: every 5 s (boot-arg `sweetps_ms`,
+  default 5000, under `sweetdiag=1`) walk `allproc` and print
+  `SWEET PS: <pid> <I/R/S/T/Z> <name> |<uu_wmesg>@<uu_wchan> ...` for every process, plus
+  `vm_page_free_count` with the header line. This is the instrument that says whether
+  `launchd_cache_loader` exists at all (failed exec?), which wait channel it sits in
+  (`vnode_sleep` = filesystem, `mach_msg` = unanswered XPC, `psynch_mutexwait` = userspace mutex,
+  absent = never started) and whether memory ran out (free pages -> 0). CI for `3e5c0a6`.
+- **0148/0149 TESTED: THE DUMP ITSELF KILLS THE BOOT (not the wall).** 0148 (`3e5c0a6`) panicked
+  4 s into the boot (log `/tmp/opencode/log0148.txt`, 124 lines, flush #6, last line `SWEET HB:
+  alive 4.0s ... (bsd_init)`, no `SWEET PS:` at all). 0149 (`3dafed0`, CI `40205989684`) starts the
+  dump only after `bsd_init` sets `sweet_diag_stage = 2`: it booted fully into userspace (log
+  `/tmp/opencode/log0149.txt`, 512 lines, flush #52, 34 kB, HB to `alive 34.0s reads=1433 86MiB
+  (userspace)`, last lines `exec FinishRestoreFromBackup`, `exec tzinit`) and panicked at the FIRST
+  post-init dump (~35 s) - again with zero `SWEET PS:` lines. So printing the process list panics
+  even in userspace; prime suspect is the `%s` of `uu_wmesg` (a stale/bogus string pointer).
+- **0150 (`cd7cfc7`), USB variant table (SM6225 vs SM6350), CI `40206700112` OK, NOT booted yet.**
+  DWC3 core and QSCRATCH are identical on both boards (`0x0a600000`, `+0xf8800`); what differs is
+  GCC (GDSCR topaz `0x0f004` / lena `0x1a004`, master `+0xf010`/`+0x1a00c`, cfg-noc `0x0502c`/
+  `0x1101c`) and the QUSB2 PHY (`0x088e2000` / `0x088e3000`). The probe scores both candidates by
+  reading GCC only (always powered), picks the one whose USB30_PRIM GDSC is on with the most USB
+  clocks running and touches DWC3/PHY only when that board's registers agree. `sweetusb_hw=1|2`
+  forces topaz/lena. USB no longer hangs off `sweethw` (`sweetusb=0` untouched, `1` read-only
+  report, `2` start the ECM gadget + UDP live log).
+- **0151 (`87c2437`), panic flush + safe dump.** Panic text never reached the ring (a panic stops
+  the log thread), so every crash still needed a photo. `sweet_early_panic()` now appends its
+  message to the console ring and `sweet_log_panic_flush()` writes it synchronously: `try_lock` on
+  `sweet_ufs_lock` (the panicking thread may hold it) and, while `sweet_log_in_panic` is set,
+  `ufs_scsi()` never sleeps (nobody would wake it) - it spins, a few KiB take microseconds. The
+  flush cursor moved from the thread stack to file scope so both paths share it. The dump now
+  prints `SWEET PS: <pid> <state> <comm> @<wchan>` (no `uu_wmesg` string), then
+  `SWEET PS: <n> processes, <free> free pages`.
+- **0151 TESTED: panic text now lands in the ring.** Log `/tmp/opencode/log0151b.txt`
+  (`flush #51`, 35 109 B) plus the user's `/home/kamil/paniclog` contain the full panic, so no
+  more photos. The panic is an assert, not a `%s` fault:
+  `panic(cpu 3 caller 0xffffe8007ace4ec): Mutex 0xffffe8007c1f6e8 is unexpectedly owned by
+  thread 0xffff24d5c48430 @lock_mtx.c:175`, right after the `SWEET PS: process dump every
+  5000 ms` header and with **zero process lines**. Symbolised offline by parsing the Mach-O
+  `LC_SYMTAB` from the kernel (no llvm-nm on this host; `/tmp/opencode/machosym.py`):
+  caller = `___lck_mtx_owned_panic`, mutex = `&proc_list_mlock` (+8). The low 32 address bits
+  of the printed values are preserved relative to the static kernel, so
+  `0xffffe8007ace4ec -> 0xfffffe0007ace4ec`.
+- **0152 (`4ec5da0`), bounded panic flush.** With `sweetusb=1` the 0151 body rebooted the phone
+  ~10 s in and the ring still held the *previous* boot (same flush number and byte count): a
+  panic whose cause has wedged the SoC interconnect leaves the UFS write pending, and the normal
+  5 s per-command deadline gave the hardware watchdog time to reset the machine. While
+  `sweet_log_in_panic` is set, commands now use a 250 ms deadline and the flush stops after 8
+  write commands; the ring header advertises the bytes actually written, so a capped flush can
+  never present stale data as new.
+- **The 0151 panic is OUR OWN DIAGNOSTIC, not launchd.** `proc_lock(p)` begins with
+  `LCK_MTX_ASSERT(&proc_list_mlock, LCK_MTX_ASSERT_NOTOWNED)`, and `sweet_diag_procs()` called it
+  inside the `allproc` walk under `proc_list_lock()` - so the first dump after
+  `sweet_diag_stage = 2` panicked before printing one process. That panic (watchdog reset after
+  it) is what killed the boot right after `exec launchd_cache_loader`.
+- **0153 (`2f45580`), dump lock order fixed.** Snapshot `p_pid` under `proc_list_lock()` only,
+  drop it, then `proc_find(pid)` (it also asserts NOTOWNED on the list lock) and take `p_mlock`
+  per process, `proc_rele()` after. USB is off the critical path: no `sweetusb*` boot-args
+  (`sweetusb=1 sweetusb_hw=2` was the first boot of 0150 and the first one that reset itself).
 - Cmdline used for the working boot: `debug=0x14 serial=3 cpus=1 keepsyms=1 -v -noprogress rd=ufsroot0
   ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin wdt=-1
   sweethw=0 sweetcpufreq=0 sweetbattery=0 sweetfb=1 sweetfb_stayon=1 sweetfb_dsi=0
@@ -68,16 +146,20 @@ run `40141908236` = kernel with 0140+0141, artifact `xnu-kernel`).
   sysstatuscheck, prng_seedctl -> **stops at `exec launchd_cache_loader`** (t = 45 s of launchd's
   1970 clock). Cosmetic-only errors there: data volume missing, BindFS /private/preboot, tzinit,
   prng seed - expected on this image.
-- **NEXT (in order):** 1) boot 0144+0145 with `cpus=4 sweetfb_flips=0` and **wait >= 5 min without
-  power-off**: `SWEET UFS: read ... MiB/s` lines decide whether `launchd_cache_loader` was only slow
-  reading, and heartbeats past 30 s prove the log flush is no longer starved (cpus=4 is expected to
-  be fine now - the earlier "cpus=4 wedge after usermanagerd" was the same UFS starvation, the screen
-  freeze was flips=1); 2) if the boot gets past the dyld cache, watch `backboardd`/SpringBoard and
-  the first `present()` into the boot fb (screen should show the Apple logo/UI, no MDP flips needed);
-  3) understand the flips=1 freeze (CTL_FLUSH/latch vs ABL's already-running CTL, maybe a missing
-  CTL_TOP/INTF trigger select or double-buffered SRC0/SPLIT_PIPE); 4) input
-  (touch over I2C/GENI, keys over SPMI) currently gated by `sweethw=0`; 5) USB/adb would end the
-  screen-photography era for good (`sweet_usb_probe` still assumes topaz DWC3).
+- **NEXT (in order):** 1) boot 0151 (`cpus=4`, `sweetfb_flips=0`, `sweethb_ms`=1 s, `sweetps_ms`=5 s,
+  cmdline as above plus `sweetusb=1 sweetusb_hw=2` for a read-only USB report), **wait >= 3 min**,
+  then `fastboot reboot recovery` -> `sh tools/sweet-log-pull.sh OUT.txt`. Read the `SWEET PS:` dump
+  around HB 33-35 s: is `launchd_cache_loader` present, in what state, on which `@wchan`, and what
+  the closing `free pages` says. If it panics again, 0151's ring now ends with the panic text itself
+  (`SWEET EARLY PANIC: ...`) - that is the whole point of the flush. 2) fix what that points at
+  (missing binary / unanswered XPC / filesystem wait / memory), then watch `backboardd`/SpringBoard
+  and the first `present()` into the boot fb (screen should show the Apple logo/UI, no MDP flips
+  needed); 3) USB: once the `SWEET USB:` report from 0151 looks right, boot again with `sweetusb=2`
+  and run `tools/sweet-usbnet.sh logs/live-NAME.txt` - live console over USB, no more recovery
+  round-trips (this is the user's newest request: log pull AND a command channel; the gadget is the
+  first half, adb/`usbMux` the second); 4) after the boot advances, retry `sweetfb_flips=1` (0146
+  flushes every CTL bit on a flip, which is what the frozen-panel experiment suggested was missing);
+  5) input (touch over I2C/GENI, keys over SPMI) currently gated by `sweethw=0`.
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 

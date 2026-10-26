@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lena <lena@x>
+Date: Mon, 26 Oct 2026 23:59:00 +0100
+Subject: [PATCH] lena-0154: show ppid, P_* flags and thread count in the dump
+
+The boot stalls right after "exec launchd_cache_loader" and every
+observation costs a manual fastboot trip, so the process dump should answer
+all of the obvious questions in one pass:
+
+  SWEET PS: <pid> <ppid> <state> <p_flag> <threads> <comm> @<wchan> ...
+
+  * absent            -> the exec never created the process
+  * P_WEXIT/P_EXEC    -> stuck inside exec/exit
+  * >1 thread         -> something in the process is still doing work
+  * @<wchan>          -> the kernel wait channel (resolvable offline)
+---
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -569,14 +569,22 @@
+ 
+ 	for (i = 0; i < n; i++) {
+ 		struct uthread *ut;
++		int nthreads = 0;
+ 
+ 		if ((p = proc_find(pids[i])) == NULL) {
+ 			continue;
+ 		}
+ 		proc_lock(p);
+-		printf("SWEET PS: %5d %c %.16s", (int)p->p_pid,
++		/* 0154: also show the parent, the P_* flags and the thread count -
++		 * one boot should be enough to tell "never started" (absent),
++		 * "stuck in exec" (P_WEXIT/P_EXEC) and "blocked" (wchan) apart. */
++		TAILQ_FOREACH(ut, &p->p_uthlist, uu_list) {
++			nthreads++;
++		}
++		printf("SWEET PS: %5d %5d %c %#06x %2d %.16s", (int)p->p_pid,
++		    (int)p->p_ppid,
+ 		    (p->p_stat > 0 && p->p_stat <= 5) ? " ?IRSZ"[p->p_stat] : '?',
+-		    p->p_comm);
++		    p->p_flag, nthreads, p->p_comm);
+ 		TAILQ_FOREACH(ut, &p->p_uthlist, uu_list) {
+ 			if (ut->uu_wchan != NULL) {
+ 				printf(" @%p", ut->uu_wchan);
