@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lena <lena@x>
+Date: Mon, 26 Oct 2026 23:55:00 +0100
+Subject: [PATCH] lena-0153: fix the lock order in the process dump
+
+The 0151 panic is now symbolised:
+
+  panic(cpu 3 caller 0xffffe8007ace4ec): Mutex 0xffffe8007c1f6e8 is
+  unexpectedly owned by thread 0xffff24d5c48430 @lock_mtx.c:175
+
+0xffffe8007ace4ec maps to ___lck_mtx_owned_panic and 0xffffe8007c1f6e8 to
+&proc_list_mlock (+8), and the only NOTOWNED assert on that mutex that can
+fire from our code is proc_lock():
+
+  void proc_lock(proc_t p)
+  {
+          LCK_MTX_ASSERT(&proc_list_mlock, LCK_MTX_ASSERT_NOTOWNED);
+          lck_mtx_lock(&p->p_mlock);
+  }
+
+sweet_diag_procs() called proc_lock() while walking allproc under
+proc_list_lock(), so the first dump (5 s after sweet_diag_stage hit 2)
+panicked before printing a single process line. That panic, not launchd,
+is what stopped the boot right after "exec launchd_cache_loader".
+
+Snapshot p_pid under the list lock, drop it, then use proc_find() (which
+itself requires the list lock not held) and take each p_mlock separately.
+---
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -533,16 +533,46 @@
+  */
+ extern unsigned int vm_page_free_count;
+ 
++#define SWEET_PS_MAX 192
++
++/*
++ * 0153: proc_lock() and proc_find() both assert that proc_list_mlock is NOT
++ * held - it is the outer lock and p_mlock is a leaf below it. 0151 called
++ * proc_lock() inside the allproc walk, so the very first dump (the one 5 s
++ * after sweet_diag_stage reached 2) panicked in proc_lock():
++ *
++ *   panic(cpu 3 caller __lck_mtx_owned_panic): Mutex <proc_list_mlock> is
++ *   unexpectedly owned by thread <self> @lock_mtx.c:175
++ *
++ * (0xfffffe0007ace4ec = ___lck_mtx_owned_panic, 0xfffffe0007c1f6e8 =
++ * &proc_list_mlock). That panic, not launchd, is what killed the boot right
++ * after "exec launchd_cache_loader".
++ *
++ * So snapshot the PIDs under the list lock, drop it, and then look each
++ * process up with proc_find(), which returns a referenced proc. Iterating
++ * p_pid under proc_list_mlock is the only access that needs the list lock.
++ */
+ static void
+ sweet_diag_procs(void)
+ {
++	pid_t pids[SWEET_PS_MAX];
+ 	struct proc *p;
+ 	int n = 0;
++	int i;
+ 
+ 	proc_list_lock();
+-	for (p = allproc.lh_first; p != NULL; p = p->p_list.le_next) {
++	for (p = allproc.lh_first; p != NULL && n < SWEET_PS_MAX;
++	    p = p->p_list.le_next) {
++		pids[n++] = p->p_pid;
++	}
++	proc_list_unlock();
++
++	for (i = 0; i < n; i++) {
+ 		struct uthread *ut;
+ 
++		if ((p = proc_find(pids[i])) == NULL) {
++			continue;
++		}
+ 		proc_lock(p);
+ 		printf("SWEET PS: %5d %c %.16s", (int)p->p_pid,
+ 		    (p->p_stat > 0 && p->p_stat <= 5) ? " ?IRSZ"[p->p_stat] : '?',
+@@ -554,9 +584,8 @@
+ 		}
+ 		printf("\n");
+ 		proc_unlock(p);
+-		n++;
++		proc_rele(p);
+ 	}
+-	proc_list_unlock();
+ 	printf("SWEET PS: %d processes, %u free pages\n", n, vm_page_free_count);
+ }
+ 
