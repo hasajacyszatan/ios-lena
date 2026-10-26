@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lena <lena@x>
+Date: Tue, 27 Oct 2026 00:05:00 +0100
+Subject: [PATCH] lena-0155: always persist the panic text in the ring
+
+0151's panic flush never ran. sweet_early_panic() began with
+
+    if (early_disabled || early_panicking) return;
+
+and early_disabled is set by arm_init long before userspace, so every panic
+after the early boot (i.e. all of them) returned before the ring copy. That
+is why the 0151 crash only exists as a photo of the screen: the ring still
+held flush #51 from 2 s before the panic.
+
+The framebuffer copy is what needs early_disabled; the ring copy must always
+happen. The persisted line now carries the caller too:
+
+    SWEET PANIC: caller 0x<16 hex>: <formatted panic string>
+
+and a second flush runs right after the debugger has printed
+
+    panic(cpu N caller 0x...): ...
+
+to the console (consdebug_putc feeds the ring), because the debugger never
+returns and nothing after that point would ever reach UFS.
+---
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1074,7 +1074,7 @@
+ 
+ #if defined(SWEET)
+ 	/* No CPU/thread/debugger state is required for this first panic copy. */
+-	sweet_early_panic(panic_format_str, panic_args);
++	sweet_early_panic(panic_format_str, panic_args, panic_caller);
+ #endif
+ 
+ #if defined(__x86_64__) && (DEVELOPMENT || DEBUG)
+@@ -1287,6 +1287,14 @@
+ #pragma clang diagnostic pop
+ 		}
+ 		paniclog_append_noflush("\n");
++#if defined(SWEET)
++		/*
++		 * 0155: the line above went through the console (and therefore
++		 * into the ring). Persist it now - the debugger never returns,
++		 * so a flush placed after this point would never run.
++		 */
++		sweet_log_panic_flush();
++#endif
+ 	}
+ #if defined(__x86_64__)
+ 	else if (((debugger_current_op == DBOP_DEBUGGER) && debugger_is_panic)) {
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -126,25 +126,46 @@
+ }
+ 
+ void
+-sweet_early_panic(const char *fmt, va_list *args)
++sweet_early_panic(const char *fmt, va_list *args, unsigned long caller)
+ {
+-	if (early_disabled || early_panicking) {
++	if (early_panicking) {
+ 		return;
+ 	}
+ 	early_panicking = 1;
+-	sweet_early_string("\nSWEET EARLY PANIC: ");
+-	va_list copy;
+-	va_copy(copy, *args);
+-	_doprnt(fmt, &copy, sweet_early_putc, 16);
+-	va_end(copy);
+-	sweet_early_putc('\n');
+-	__asm__ volatile("dsb sy" ::: "memory");
+ 
+-	/* 0151: persist the panic text before the debugger takes over. */
++	/*
++	 * 0155: early_disabled only says that the boot framebuffer mapping is
++	 * gone (arm_init disables it long before userspace), so gating the ring
++	 * copy on it meant 0151 never persisted a single panic: the 0151 crash
++	 * was only saved by photographing the screen. Draw on the fb while it
++	 * is still mapped, but always write the ring.
++	 */
++	if (!early_disabled) {
++		sweet_early_string("\nSWEET EARLY PANIC: ");
++		va_list copy;
++		va_copy(copy, *args);
++		_doprnt(fmt, &copy, sweet_early_putc, 16);
++		va_end(copy);
++		sweet_early_putc('\n');
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++
++	/* Persist the panic text (and the caller) before the debugger takes over. */
+ 	{
+-		static const char prefix[] = "\nSWEET EARLY PANIC: ";
++		static const char prefix[] = "\nSWEET PANIC: caller ";
++		char hex[20];
++		va_list copy;
++		int i = 0;
+ 
+ 		sweet_log_append(prefix, sizeof(prefix) - 1);
++		hex[i++] = '0';
++		hex[i++] = 'x';
++		for (int shift = 60; shift >= 0; shift -= 4) {
++			unsigned int d = (unsigned int)((caller >> shift) & 0xf);
++			hex[i++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
++		}
++		sweet_log_append(hex, i);
++		sweet_log_append(": ", 2);
+ 		va_copy(copy, *args);
+ 		_doprnt(fmt, &copy, sweet_early_ring_putc, 16);
+ 		va_end(copy);
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -9,9 +9,11 @@
+ #if defined(SWEET)
+ void sweet_early_mark(unsigned int stage, const char *label);
+ void sweet_early_putc(char c);
+-void sweet_early_panic(const char *fmt, va_list *args);
++void sweet_early_panic(const char *fmt, va_list *args, unsigned long caller);
+ void sweet_early_relocate(uint64_t base);
+ void sweet_early_disable(void);
++/* bsd/dev/sweet_ufs.c: write the console ring to UFS from panic context. */
++void sweet_log_panic_flush(void);
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)
+ {
