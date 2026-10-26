@@ -112,7 +112,7 @@ heartbeats of the 0155 boot were lost that way).
  #define SWEET_PS_MAX 192
  
  /*
-@@ -560,7 +570,30 @@
+@@ -560,7 +570,29 @@
  	int n = 0;
  	int i;
  
@@ -134,17 +134,16 @@ heartbeats of the 0155 boot were lost that way).
 +			    sweet_plock_held_since, &ns);
 +			held_ms = ns / NSEC_PER_MSEC;
 +		}
-+		printf("SWEET PS: proc_list_mlock busy, dump skipped: holder pid %d thread 0x%llx site 0x%llx held %llu ms, state 0x%08x\n",
++		printf("SWEET PS: proc_list_mlock busy, dump skipped: holder pid %d thread 0x%llx site 0x%llx held %llu ms\n",
 +		    sweet_plock_holder_pid,
 +		    (uint64_t)(uintptr_t)sweet_plock_holder,
-+		    (uint64_t)sweet_plock_site, held_ms,
-+		    proc_list_mlock.lck_mtx.data);
++		    (uint64_t)sweet_plock_site, held_ms);
 +		return;
 +	}
  	for (p = allproc.lh_first; p != NULL && n < SWEET_PS_MAX;
  	    p = p->p_list.le_next) {
  		pids[n++] = p->p_pid;
-@@ -574,7 +607,17 @@
+@@ -574,7 +606,17 @@
  		if ((p = proc_find(pids[i])) == NULL) {
  			continue;
  		}
@@ -155,15 +154,15 @@ heartbeats of the 0155 boot were lost that way).
 +		 * precisely the interesting one.
 +		 */
 +		if (!lck_mtx_try_lock(&p->p_mlock)) {
-+			printf("SWEET PS: %5d p_mlock busy, skipped (state 0x%08x)\n",
-+			    (int)p->p_pid, p->p_mlock.lck_mtx.data);
++			printf("SWEET PS: %5d p_mlock busy, skipped\n",
++			    (int)p->p_pid);
 +			proc_rele(p);
 +			continue;
 +		}
  		/* 0154: also show the parent, the P_* flags and the thread count -
  		 * one boot should be enough to tell "never started" (absent),
  		 * "stuck in exec" (P_WEXIT/P_EXEC) and "blocked" (wchan) apart. */
-@@ -602,6 +645,7 @@
+@@ -602,6 +644,7 @@
  {
  	int period = 5000;                      /* boot-arg sweetps_ms */
  	bool announced = FALSE;
@@ -171,7 +170,7 @@ heartbeats of the 0155 boot were lost that way).
  
  	PE_parse_boot_argn("sweetps_ms", &period, sizeof(period));
  	if (period < 500) {
-@@ -628,6 +672,13 @@
+@@ -628,6 +671,13 @@
  			announced = TRUE;
  			printf("SWEET PS: process dump every %d ms (pid state name @wchan)\n", period);
  		}
@@ -198,7 +197,7 @@ heartbeats of the 0155 boot were lost that way).
  #include <kern/coalition.h>
  #include <kern/kern_types.h>
  #include <kern/kalloc.h>
-@@ -1235,6 +1239,72 @@
+@@ -1235,6 +1239,71 @@
  	lck_spin_unlock(&p->p_slock);
  }
  
@@ -243,12 +242,11 @@ heartbeats of the 0155 boot were lost that way).
 +				absolutetime_to_nanoseconds(now - sweet_plock_held_since,
 +				    &held_ns);
 +			}
-+			printf("SWEET LOCK: proc_list_mlock busy: waiter 0x%llx, holder pid %d thread 0x%llx site 0x%llx held %llu ms, state 0x%08x\n",
++			printf("SWEET LOCK: proc_list_mlock busy: waiter 0x%llx, holder pid %d thread 0x%llx site 0x%llx held %llu ms\n",
 +			    (uint64_t)(uintptr_t)__builtin_return_address(0),
 +			    sweet_plock_holder_pid,
 +			    (uint64_t)(uintptr_t)sweet_plock_holder,
-+			    (uint64_t)sweet_plock_site, held_ns / NSEC_PER_MSEC,
-+			    proc_list_mlock.lck_mtx.data);
++			    (uint64_t)sweet_plock_site, held_ns / NSEC_PER_MSEC);
 +		}
 +		lck_mtx_lock(&proc_list_mlock);
 +	}
@@ -271,7 +269,7 @@ heartbeats of the 0155 boot were lost that way).
  void
  proc_list_lock(void)
  {
-@@ -1246,6 +1316,7 @@
+@@ -1246,6 +1315,7 @@
  {
  	lck_mtx_unlock(&proc_list_mlock);
  }

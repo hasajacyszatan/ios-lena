@@ -153,7 +153,11 @@ run `40141908236` = kernel with 0140+0141, artifact `xnu-kernel`).
   `task_terminate_internal()` of the old task; the dump uses `lck_mtx_try_lock()` and reports the
   holder instead of blocking; `proc_list_lock()` records holder thread/pid/caller-return-address
   and time, and prints a `SWEET LOCK:` line once a second when a waiter blocks. `msleep()` over
-  that mutex bypasses the bookkeeping, so the recorded holder is advisory.
+  that mutex bypasses the bookkeeping, so the recorded holder is advisory. Note for future bsd
+  code: `bsd/` sources are compiled with `-UMACH_KERNEL_PRIVATE` (`makedefs/MakeInc.def`), so on
+  arm64 `lck_mtx_t` there is the KDK form `uintptr_t opaque[2]` - the `lck_mtx`/`lck_mtx_owner`
+  internals are only visible in osfmk sources. The first build (CI 40421089057) failed on exactly
+  that (`no member named 'lck_mtx'`); the lock report now prints holder pid/thread/site only.
 - Cmdline used for the working boot: `debug=0x14 serial=3 cpus=1 keepsyms=1 -v -noprogress rd=ufsroot0
   ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin wdt=-1
   sweethw=0 sweetcpufreq=0 sweetbattery=0 sweetfb=1 sweetfb_stayon=1 sweetfb_dsi=0
