@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lena <lena@x>
+Date: Mon, 26 Oct 2026 23:50:00 +0100
+Subject: [PATCH] lena-0152: bound the panic flush in time and command count
+
+The 0151 body booted with sweetusb=1 and rebooted the phone about 10 s in
+with the console ring still holding the PREVIOUS boot's content (same
+flush number, same byte count). A panic whose cause has wedged the SoC
+interconnect leaves the UFS write never completing, so the panic flush
+spun inside the driver with the normal 5 s per-command deadline - long
+enough for the hardware watchdog to reset the machine, throwing away both
+the panic text and everything before it.
+
+While sweet_log_in_panic is set, commands now use a 250 ms deadline and
+the flush stops after 8 write commands (the ring needs at most 5). The
+header advertises the bytes actually written, so a capped flush cannot
+make the pull read stale data as if it were new.
+---
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -78,6 +78,16 @@
+ #define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
+ #define CMD_SPIN_NS     (50ull * NSEC_PER_USEC)
+ #define CMD_SLEEP_NS    (200ull * NSEC_PER_USEC)
++/*
++ * 0152: the panic flush must finish in bounded time. A panic caused by a bad
++ * register access can leave the SoC interconnect wedged, so a write never
++ * completes; with the normal 5 s timeout and a 4 MiB ring that is minutes of
++ * spinning inside panic(), which the hardware watchdog turns into a silent
++ * reset (the phone reboots ~10 s into the boot and the ring keeps the PREVIOUS
++ * boot's content). Short deadline, hard cap on the command count.
++ */
++#define PANIC_TIMEOUT_NS (250ull * NSEC_PER_MSEC)
++#define PANIC_LOG_CMDS   8
+ 
+ struct utrd {
+ 	uint32_t dw0, dw1, dw2, dw3;
+@@ -215,7 +225,8 @@
+ 	uint64_t start = mach_absolute_time();
+ 	ufs_wr(REG_UTRLDBR, 1);
+ 	uint64_t deadline;
+-	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	nanoseconds_to_absolutetime(sweet_log_in_panic ? PANIC_TIMEOUT_NS : CMD_TIMEOUT_NS,
++	    &deadline);
+ 	deadline += start;
+ 	/*
+ 	 * 0151: a flush from panic() must never sleep. The machine is about to
+@@ -1024,6 +1035,7 @@
+ 	uint64_t pos = total - sweet_log_flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : sweet_log_flushed;
+ 	void *bounce = (void *)(su.dma + DMA_BOUNCE);
+ 	int error = 0;
++	int cmds = 0;
+ 
+ 	while (pos < total && !error) {
+ 		uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
+@@ -1033,12 +1045,18 @@
+ 		    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
+ 		memcpy(bounce, sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
+ 		error = ufs_write_blocks(base + 1 + blk, n);
++		cmds++;
+ 		pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
++		if (sweet_log_in_panic && cmds >= PANIC_LOG_CMDS) {
++			break;
++		}
+ 	}
+ 	if (!error) {
+ 		struct sweet_log_header h = {
+ 			.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
+-			.version = 1, .size = SWEET_LOG_SIZE, .total = total, .seq = ++sweet_log_seq,
++			/* 0152: advertise only bytes actually written (pos == total
++			 * unless the panic command cap stopped us early). */
++			.version = 1, .size = SWEET_LOG_SIZE, .total = pos, .seq = ++sweet_log_seq,
+ 		};
+ 		bzero(bounce, UFS_BLOCK);
+ 		memcpy(bounce, &h, sizeof(h));
+@@ -1047,12 +1065,12 @@
+ 	if (!error) {
+ 		error = ufs_sync_cache();
+ 	}
+-	if (!quiet) {
+-		if (error) {
+-			printf("SWEET LOG: write failed (%d), stopping\n", error);
+-		}
++	if (!quiet && error) {
++		printf("SWEET LOG: write failed (%d), stopping\n", error);
++	}
++	if (!error) {
++		sweet_log_flushed = pos;
+ 	}
+-	sweet_log_flushed = total;
+ }
+ 
+ void
