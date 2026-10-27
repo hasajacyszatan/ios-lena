@@ -1,0 +1,292 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lena <lena@x>
+Date: Tue, 27 Oct 2026 02:20:00 +0100
+Subject: [PATCH] lena-0157: a heartbeat that cannot be blocked, and the first
+ syscalls of every spawned process
+
+The 0156 boot finally walked through the whole spawn of launchd_cache_loader
+(SWEET SIG: signed 1 -> no taskgated upcall -> task_did_exec 0 -> returning
+error 0) and then went silent 0.6 s later. The persisted ring is 44883 bytes
+and ends exactly at that line; the 1 s heartbeat stops at 32 s and the 5 s
+process dump never printed at all, although a userspace thread was still
+printing five kilobytes at 45 s. So either the kernel is dead, or every printf
+is stuck while the machine is alive - the ring cannot tell them apart.
+
+Three instruments, all of which must keep working through a console deadlock:
+
+1. sweet_ring_str/num/int: append straight into the console ring. No printf,
+   no lock, no allocation, numbers formatted by hand.
+
+2. SWEET HBB, a diagnostic thread that never sleeps and never calls printf.
+   It prints one line a second with the ring position and the enter/exit
+   counters of the two sleeping diagnostic threads:
+
+     SWEET HBB: alive 45s ring 44883 hb 32/32 ps 0/0
+
+   `hb 32/33` means the heartbeat thread is stuck inside printf (enter >
+   exit); `hb 32/32` with no new SWEET HB line means it never woke up; if HBB
+   itself stops, the kernel really is gone. A broken timer cannot stop it.
+
+3. SWEET SYS: the first 40 syscalls of every process with pid 14..45, entry
+   and exit, written straight into the ring. The child that is spawned right
+   before the silence is the prime suspect, and an entry without its exit
+   names the syscall that never returned.
+---
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -44,6 +44,59 @@
+ extern void
+ unix_syscall(struct arm_saved_state * regs, thread_t thread_act, struct proc * proc);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 0157: name the syscall that never returns.
++ *
++ * The 0156 boot printed its last line 0.6 s after launchd spawned
++ * launchd_cache_loader and then went completely silent, so the first syscalls
++ * of that child are the interesting ones. Trace the first SWEET_SYS_MAX calls
++ * of every pid in [SWEET_SYS_PID_LO, SWEET_SYS_PID_HI) - launchd itself and the
++ * kernel tasks stay quiet - and write them straight into the console ring:
++ * these lines must survive even if printf/console is what hangs.
++ */
++#define SWEET_SYS_PID_LO        14
++#define SWEET_SYS_PID_HI        46
++#define SWEET_SYS_MAX           40
++
++extern void sweet_ring_str(const char *s);
++extern void sweet_ring_num(uint64_t v);
++extern void sweet_ring_int(int64_t v);
++extern char const *syscallnames[];
++
++static uint16_t sweet_sys_seen[SWEET_SYS_PID_HI - SWEET_SYS_PID_LO];
++
++static void
++sweet_sys_trace(pid_t pid, int code, boolean_t enter, int error)
++{
++	const char *name = "?";
++	int idx;
++
++	if (pid < SWEET_SYS_PID_LO || pid >= SWEET_SYS_PID_HI) {
++		return;
++	}
++	idx = pid - SWEET_SYS_PID_LO;
++	if (sweet_sys_seen[idx] >= 2 * SWEET_SYS_MAX) {
++		return;
++	}
++	sweet_sys_seen[idx]++;
++	if (code >= 0 && code < nsysent && syscallnames[code] != NULL) {
++		name = syscallnames[code];
++	}
++	sweet_ring_str("SWEET SYS: pid ");
++	sweet_ring_int(pid);
++	sweet_ring_str(enter ? " in " : " out ");
++	sweet_ring_int(code);
++	sweet_ring_str(" ");
++	sweet_ring_str(name);
++	if (!enter) {
++		sweet_ring_str(" err ");
++		sweet_ring_int(error);
++	}
++	sweet_ring_str("\n");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ static int      arm_get_syscall_args(uthread_t, struct arm_saved_state *, const struct sysent *);
+ static int      arm_get_u32_syscall_args(uthread_t, arm_saved_state32_t *, const struct sysent *);
+ static void     arm_prepare_u32_syscall_return(const struct sysent *, arm_saved_state_t *, uthread_t, int);
+@@ -112,6 +165,10 @@
+ 	syscode = (code < nsysent) ? code : SYS_invalid;
+ 	callp   = &sysent[syscode];
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_sys_trace(proc_pid(proc), syscode, TRUE, 0);
++#endif
++
+ 	/*
+ 	 * sy_narg is inaccurate on ARM if a 64 bit parameter is specified. Since user_addr_t
+ 	 * is currently a 32 bit type, this is really a long word count. See rdar://problem/6104668.
+@@ -189,6 +246,10 @@
+ 	    uthread->uu_rval[0], uthread->uu_rval[1],
+ 	    pid, get_bsdtask_info(current_task()) ? proc->p_comm : "unknown", thread_tid(current_thread()));
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_sys_trace(pid, syscode, FALSE, error);
++#endif
++
+ #ifdef CONFIG_IOCOUNT_TRACE
+ 	if (uthread->uu_iocount) {
+ 		printf("system call returned with uu_iocount(%d) != 0",
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -968,6 +968,61 @@
+ }
+ 
+ /*
++ * 0157: a printf that cannot be blocked by the console.
++ *
++ * The 0156 boot went silent 0.6 s after launchd_cache_loader was spawned: the
++ * last line in the ring is that spawn returning, the persisted total is exactly
++ * the end of that line, and neither the 1 s heartbeat nor the 5 s process dump
++ * ever printed again - yet a plain userspace thread printed 5 KiB a second
++ * earlier. Either the kernel died, or every printf (and with it the console
++ * path) is stuck while the machine is still alive.
++ *
++ * These helpers append straight into the console ring and never call printf,
++ * take no lock and allocate nothing, so a diagnostic thread can keep reporting
++ * through any console deadlock. Numbers are formatted by hand because the
++ * vsnprintf/kprintf path is exactly what may be broken.
++ */
++void sweet_ring_str(const char *s);
++void sweet_ring_num(uint64_t v);
++void sweet_ring_int(int64_t v);
++
++void
++sweet_ring_str(const char *s)
++{
++	int n = (int)strlen(s);
++
++	if (n > 0) {
++		sweet_log_append(s, n);
++	}
++}
++
++void
++sweet_ring_num(uint64_t v)
++{
++	char tmp[21];
++	int i = 0;
++
++	do {
++		tmp[i++] = (char)('0' + (int)(v % 10));
++		v /= 10;
++	} while (v != 0 && i < (int)sizeof(tmp));
++	while (i-- > 0) {
++		sweet_log_append(&tmp[i], 1);
++	}
++}
++
++void
++sweet_ring_int(int64_t v)
++{
++	if (v < 0) {
++		sweet_log_append("-", 1);
++		sweet_ring_num((uint64_t)(-(v + 1)) + 1);
++	} else {
++		sweet_ring_num((uint64_t)v);
++	}
++}
++
++/*
+  * Copy console bytes [*pos, total) (at most max) for live log streaming
+  * (sweet_usb.c). A reader that fell more than the ring behind skips ahead.
+  * Returns the byte count; *pos advances.
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -474,6 +474,21 @@
+  */
+ extern void sweet_ufs_counters(uint64_t *reads, uint64_t *kib);
+ 
++/*
++ * 0157: lock-free ring output (bsd/dev/sweet_ufs.c) and the two halves of each
++ * diagnostic printf. "hb 12/11" in the busy heartbeat means the sleep-based
++ * heartbeat thread has *entered* printf 12 times and left it 11, i.e. it is
++ * stuck inside printf/console right now; "hb 11/11" with the seconds not
++ * moving means it never got out of its sleep, i.e. wakeups are broken.
++ */
++extern void sweet_ring_str(const char *s);
++extern void sweet_ring_num(uint64_t v);
++extern void sweet_ring_int(int64_t v);
++extern uint64_t sweet_log_position(void);
++
++volatile uint64_t sweet_hb_enter, sweet_hb_exit;
++volatile uint64_t sweet_ps_enter, sweet_ps_exit;
++
+ static void
+ sweet_diag_heartbeat(void *arg, wait_result_t wr)
+ {
+@@ -505,14 +520,65 @@
+ 			uint64_t reads = 0, kib = 0;
+ 
+ 			sweet_ufs_counters(&reads, &kib);
++			sweet_hb_enter++;
+ 			printf("SWEET HB: alive %u.%us reads=%llu %lluMiB (%s)\n",
+ 			    secs / 1000, (secs % 1000) / 100, reads, kib >> 10,
+ 			    sweet_diag_stage < 2 ? "bsd_init" : "userspace");
++			sweet_hb_exit++;
+ 		}
+ 	}
+ }
+ 
+ /*
++ * 0157: a heartbeat that needs no timer, no wakeup and no printf.
++ *
++ * The 0156 boot's 1 s heartbeat and 5 s dump both stopped at ~33 s while a
++ * userspace thread still printed five kilobytes 12 s later, so "the whole
++ * kernel is dead" and "the diagnostic threads are stuck in a wait/printf" look
++ * identical from outside. This thread never sleeps (so a broken timer cannot
++ * stop it), never calls printf (so a stuck console cannot stop it) and reports
++ * the state of the other two threads through the ring:
++ *
++ *   SWEET HBB: alive 45s ring 44883 hb 32/32 ps 0/0
++ *
++ * The line keeps coming while the kernel is alive, and `hb`/`ps` say whether
++ * the sleeping threads are inside printf (enter > exit) or never woke up.
++ */
++static void
++sweet_diag_busy(void *arg, wait_result_t wr)
++{
++	uint64_t last = mach_absolute_time();
++	uint64_t secs = 0;
++
++	(void)arg;
++	(void)wr;
++	sweet_ring_str("SWEET HBB: busy heartbeat thread started\n");
++	for (;;) {
++		uint64_t ns = 0;
++
++		absolutetime_to_nanoseconds(mach_absolute_time() - last, &ns);
++		if (ns < NSEC_PER_SEC) {
++			continue;
++		}
++		last = mach_absolute_time();
++		secs++;
++		sweet_ring_str("SWEET HBB: alive ");
++		sweet_ring_num(secs);
++		sweet_ring_str("s ring ");
++		sweet_ring_num(sweet_log_position());
++		sweet_ring_str(" hb ");
++		sweet_ring_num(sweet_hb_enter);
++		sweet_ring_str("/");
++		sweet_ring_num(sweet_hb_exit);
++		sweet_ring_str(" ps ");
++		sweet_ring_num(sweet_ps_enter);
++		sweet_ring_str("/");
++		sweet_ring_num(sweet_ps_exit);
++		sweet_ring_str("\n");
++	}
++}
++
++/*
+  * 0148/0149/0151: who is blocked on what. The 0147 boot answered the previous
+  * question (the kernel is alive, the log flushes, and NO UFS command is in
+  * flight - no "still waiting", counters frozen at 1517 cmds / 93 MiB): after
+@@ -678,7 +744,9 @@
+ 		 * even when nothing inside the walk printed anything.
+ 		 */
+ 		printf("SWEET PS: dump %u start\n", ++dumps);
++		sweet_ps_enter++;
+ 		sweet_diag_procs();
++		sweet_ps_exit++;
+ 	}
+ }
+ 
+@@ -698,6 +766,9 @@
+ 	if (kernel_thread_start(sweet_diag_procs_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	if (kernel_thread_start(sweet_diag_busy, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
