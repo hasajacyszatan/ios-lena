@@ -157,11 +157,58 @@ run `40141908236` = kernel with 0140+0141, artifact `xnu-kernel`).
   code: `bsd/` sources are compiled with `-UMACH_KERNEL_PRIVATE` (`makedefs/MakeInc.def`), so on
   arm64 `lck_mtx_t` there is the KDK form `uintptr_t opaque[2]` - the `lck_mtx`/`lck_mtx_owner`
   internals are only visible in osfmk sources. The first build (CI 40421089057) failed on exactly
-  that (`no member named 'lck_mtx'`); the lock report now prints holder pid/thread/site only.
-- Cmdline used for the working boot: `debug=0x14 serial=3 cpus=1 keepsyms=1 -v -noprogress rd=ufsroot0
+  that (`no member named 'lck_mtx'`); the lock report now prints holder pid/thread/site only. Fixed
+  in `f159986`, CI **40422305815 = success**.
+- **0156 boot (`/tmp/opencode/log0156.txt` + `.bin`, flush #51, total 44 883 B) - the spawn now
+  completes end to end, and then everything stops.** pid 22 `launchd_cache_loader`:
+  `csflags 0x22000001 signed 1` (no taskgated upcall) -> `process_signature -> 0` ->
+  `task_did_exec 0` -> `returning error 0`, and that last line is the *end* of the persisted ring
+  (offset 44 883). Nothing after it: no panic, no reboot, no more UFS reads (`reads=1078 83MiB`
+  frozen, vs 1517/93MiB on 0155), `SWEET HB` stops at `alive 32.0s` (offset 39 221) and
+  **`SWEET PS` never printed a single line** - not even its "dump N start" header. Yet launchd's
+  own userspace lines (`[System Event] ... launchd_cache_loader Doing boot task`) were still being
+  written at 45 s, i.e. ~13 s *after* the last kernel heartbeat. So the machine was alive and
+  printing userspace, while our own diagnostic printfs stopped. Data past offset 45 056 in the ring
+  is stale 0155 content - do not misread it as this boot.
+- **0157 (`xnu/patches/0157-lena-busy-heartbeat-syscall-trace.patch`, `2907486`): make the silence
+  speak.** The ring cannot distinguish "dead kernel" from "every printf stuck" while the heartbeat
+  thread itself uses printf, so: (a) `sweet_ring_str/num/int` in `bsd/dev/sweet_ufs.c` append
+  straight into the console ring - no printf, no lock, no allocation, hand-formatted numbers;
+  (b) `SWEET HBB`, a thread that never sleeps and never calls printf, printing once a second
+  `alive <n>s ring <total> hb <enter>/<exit> ps <enter>/<exit>`; (c) `SWEET SYS: pid N in|out
+  <code> <name> [err E]` for the first 40 syscalls of every pid 14..45, straight into the ring.
+  Reading it: HBB keeps coming -> kernel alive, then `hb 32/33` = heartbeat thread stuck inside
+  printf, `hb 32/32` with no new `SWEET HB` = it never woke up, and `ps 0/0` with no PS lines =
+  the dump thread deadlocked before its first header; HBB silent too = real dead kernel. An
+  `in` without its matching `out` names the syscall that never returned.
+- **0157 boot (`/tmp/opencode/log0157.txt` + `.bin`, flush #64, total 67 196 B) - the freeze is
+  real, and it happens 5 s later than 0156.** The new instruments answered their question: `SWEET
+  HBB` printed every second from 1 to 37 s with `hb 36/36 ps 3/3` at the end, i.e. neither the
+  heartbeat nor the dump thread was ever stuck *inside printf*, and the dump thread completed 3
+  dumps (kernel_task 0, launchd 1, mobile_obliterator 5, 71 288 free pages) then stopped after
+  6 s. At 37 s all three diagnostics fall silent in the same second (offset 47 844), yet the ring
+  keeps growing to 67 196 B: `auearlyboot` (pid 16), `tzinit` (17), then posix_spawn of pids 20/21
+  with the syscall trace running, ending at `SWEET EXEC: pid 21 done error 0` (prng_seedctl) -
+  for pid 22 in 0156 the same point was after `returning error 0`. Clock alignment: launchd's
+  `16:00:49.93` = kernel 37 s (offset ~13 s), so in 0156 too (launchd `45.09` = kernel 32.2 s) the
+  diagnostics died *at* the freeze, not before it. The syscall trace had 547 lines for pids
+  14..20 and **not one `in` without its `out`**, so the hanging call is outside its window (pid 1,
+  or a pid past its 40-call budget) - hence 0158. No panic, no reboot: the machine just stops.
+- **0158 (`xnu/patches/0158-lena-per-cpu-heartbeat-stuck-syscall.patch`): one busy heartbeat per
+  CPU plus a "which syscall is running right now" table.** `sweet_diag_start()` starts one
+  never-sleeping, printf-free busy thread per CPU (the `cpus` boot-arg, capped at 8), each printing
+  its own `cpu_number()` and unit index once a second: a per-CPU hang shows as one silent unit
+  among live ones, and only a machine-wide freeze silences all of them. In
+  `bsd/dev/arm/systemcalls.c` a 128-slot table records per thread the syscall it is inside plus its
+  entry timestamp (entry publishes the tid, exit clears it); every busy thread prints entries older
+  than 1.5 s as `SWEET STUCK: pid P code C name for Ns`, at most six per second, so the last
+  snapshot before a freeze names the call that was already hanging.
+- cpus=1 experiment (same 0157 kernel, only the cmdline changed, image `3274a027...`): run to see
+  whether the freeze is an SMP/lock problem; nothing in the log above depends on USB.
+- Cmdline used for the working boot: `debug=0x14 serial=3 cpus=4 keepsyms=1 -v -noprogress rd=ufsroot0
   ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin wdt=-1
   sweethw=0 sweetcpufreq=0 sweetbattery=0 sweetfb=1 sweetfb_stayon=1 sweetfb_dsi=0
-  sweetfb_noconsole=1 sweetdiag=1 launchd_unsecure_cache=1`.
+  sweetfb_noconsole=1 sweetdiag=1 sweetps_ms=2000 launchd_unsecure_cache=1`.
 - Boot image: `shim/out/shim-boot-lena.img` built by `shim/build-lena.sh` with
   `PATH=~/.local/usr/bin:$PATH LD_LIBRARY_PATH=... DTB=/home/kamil/xperia-backup/boot_unpacked/dtb MKBOOTIMG=mkbootimg`;
   payload = `tools/mkpayload.py <kernel> shim/out/lena.adt shim/out/payload.bin --cmdline "..."`.
