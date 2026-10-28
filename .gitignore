@@ -8,3 +8,6 @@ shim/out/
 xnu/out/
 xnu/out-*/
 __pycache__/
+# local artifacts (Apple images, device dumps, build products, phone backups)
+artifacts/
+xperia-backup/

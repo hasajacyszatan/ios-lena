@@ -4,9 +4,25 @@
 
 ### >>> UPDATE 2026-10-25 lena (Xperia 10 III / pdx213): first boot into launchd <<<
 
-**iOS now reaches userspace on lena.** Repo `hasajacyszatan/ios-lena`, branch `lena` (HEAD = 0140..0156).
+**iOS now reaches userspace on lena.** Repo `hasajacyszatan/ios-lena`, branch `lena` (HEAD = 0140..0158).
 Kernel CI: `gh workflow run xnu.yml -R hasajacyszatan/ios-lena --ref lena` (push to `lena` also builds;
 run `40141908236` = kernel with 0140+0141, artifact `xnu-kernel`).
+
+**Everything local lives in this repo now (2026-10-28).** The home directory holds nothing
+iOS-related any more; `artifacts/` and `xperia-backup/` are gitignored:
+
+- `artifacts/apple/` - the 16.7.16 ipsw, the five `087-*.dmg` images, `Firmware/`, `BuildManifest.plist`,
+  `kernelcache.release.iphone10b` (extracted Apple files).
+- `artifacts/images/` - `ios16-root.img` / `ios16-root.simg` (the HFS+ root that is written to `userdata`).
+- `artifacts/logs/` - `bootlog`, `paniclog`, `kernel_panic_log.txt.bin`, `sweetlog_tail*.bin`,
+  `ring-2026-10-20.bin`.
+- `artifacts/build/` - downloaded CI artifacts and old build products (`xnu-kernel/`, `xnu-lena-bt/`,
+  `xnu-lena-out/`, `buildtree.tgz`, `xnu-*.zip`, `payload*.bin`, `old-shim-boot-lena.img`,
+  `old-dtb-pdx213.bin`).
+- `artifacts/xperia/` - `recovery.img`, `xperia-dump/fdt.dtb`; `xperia-backup/` (the boot_a backup and
+  the unpacked `dtb` used by `shim/build-lena.sh`, which defaults `DTB` to it) sits in the repo root.
+- Live boot logs stay in `/tmp/opencode/` (`log01xx.txt` + `.bin`), which is a tmpfs and is not a
+  backup: anything worth keeping belongs in `artifacts/logs/`.
 
 - **0140 (commit `e74957e`)**: 4-hex line counter prefix in the fbcon (screen order is only
   decodable with it: 78-row circular buffer that wraps to the top), `DEBUG_BSDINIT 1`,
@@ -101,7 +117,7 @@ run `40141908236` = kernel with 0140+0141, artifact `xnu-kernel`).
   prints `SWEET PS: <pid> <state> <comm> @<wchan>` (no `uu_wmesg` string), then
   `SWEET PS: <n> processes, <free> free pages`.
 - **0151 TESTED: panic text now lands in the ring.** Log `/tmp/opencode/log0151b.txt`
-  (`flush #51`, 35 109 B) plus the user's `/home/kamil/paniclog` contain the full panic, so no
+  (`flush #51`, 35 109 B) plus `artifacts/logs/paniclog` contain the full panic, so no
   more photos. The panic is an assert, not a `%s` fault:
   `panic(cpu 3 caller 0xffffe8007ace4ec): Mutex 0xffffe8007c1f6e8 is unexpectedly owned by
   thread 0xffff24d5c48430 @lock_mtx.c:175`, right after the `SWEET PS: process dump every
@@ -205,12 +221,40 @@ run `40141908236` = kernel with 0140+0141, artifact `xnu-kernel`).
   snapshot before a freeze names the call that was already hanging.
 - cpus=1 experiment (same 0157 kernel, only the cmdline changed, image `3274a027...`): run to see
   whether the freeze is an SMP/lock problem; nothing in the log above depends on USB.
+- **cpus=1 result (`/tmp/opencode/log0157c1.txt`, flush #392, total 95 738 B): the freeze is NOT
+  an SMP race.** With one CPU the machine runs three times longer in kernel time (HBB 1..137 s,
+  `hb 136/136 ps 53/53`, 53 process dumps, 68 620 free pages) and gets one step further into the
+  boot (`SWEET PS: 22 1 I 0x4084 1 launchd_cache_lo`, the `launchd_cache_loader Doing boot task`
+  event at launchd `16:02:28.41`), then stops just the same - inside the spawn that follows the
+  event, before the first `SWEET SPAWN: pid 23 start launchd` marker. So: single CPU, a busy
+  thread that never sleeps, all syscalls returning, no panic, no reset - and the whole machine
+  goes silent anyway. That rules out a cross-CPU lock/TLB race and points at the spawn/exec path
+  itself (or at the hardware it touches), with the freeze point moving with timing: after
+  `returning error 0` (0156), during pid 21 exec (0157 cpus=4), before pid 23's first marker
+  (cpus=1).
+- **0158 result (`/tmp/opencode/log0158.txt` + `.bin`, header `total 120 017`, seq 335, image
+  `33aae808...`, booted 15:00:53, ran ~6 min).** The new instruments survived the freeze itself:
+  all four busy units printed `alive 109s` in the last second (`hb 108/108 ps 39/39`), so the
+  freeze is machine-wide between 109 s and 110 s, not a per-CPU lock. `SWEET STUCK` (176 lines)
+  names only *blocking, legitimate* calls right up to the end: `pid 1 code 400 wait4_nocancel` up to
+  10 s, `pid 1 code 368 workq_kernreturn` up to 9 s, `361 bsdthread_terminate` 2-3 s - i.e. launchd
+  waiting for its child, and no long in-flight syscall on pid 22. The last content in the ring is
+  pid 22 (`launchd_cache_loader`) `returning error 0`, then ~40 dyld syscalls ending
+  `out 338 stat64 err 2` (offset 119 978, next to the ring end).
+- **0158 blind spots.** (a) the process dump stopped after dump 39 (`20 sysstatuscheck`, ~78 s) while
+  HBB kept printing: the dump thread blocks in `proc_find`/`p_mlock` *without* any `SWEET LOCK`
+  line, because 0158 only reports holders it can try-lock - 0156's bookkeeping is still unobservable
+  here. (b) UFS: counters froze at `reads=1514 88MiB` and there is **no `still waiting` line**
+  (grep count 0), so no SCSI command was in flight at the freeze; the only UFS oddities are the
+  earlier slow reads (up to `479977 us` for a 196 KiB read, `5121 us/cmd, 15 MiB/s` for the 64 MiB
+  phase). So the freeze is not a hung UFS read either - the next suspect is whatever pid 22 does
+  immediately after its last `stat64`/`open` at ~109 s.
 - Cmdline used for the working boot: `debug=0x14 serial=3 cpus=4 keepsyms=1 -v -noprogress rd=ufsroot0
   ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin wdt=-1
   sweethw=0 sweetcpufreq=0 sweetbattery=0 sweetfb=1 sweetfb_stayon=1 sweetfb_dsi=0
   sweetfb_noconsole=1 sweetdiag=1 sweetps_ms=2000 launchd_unsecure_cache=1`.
 - Boot image: `shim/out/shim-boot-lena.img` built by `shim/build-lena.sh` with
-  `PATH=~/.local/usr/bin:$PATH LD_LIBRARY_PATH=... DTB=/home/kamil/xperia-backup/boot_unpacked/dtb MKBOOTIMG=mkbootimg`;
+  `PATH=~/.local/usr/bin:$PATH LD_LIBRARY_PATH=... DTB=xperia-backup/boot_unpacked/dtb MKBOOTIMG=mkbootimg`;
   payload = `tools/mkpayload.py <kernel> shim/out/lena.adt shim/out/payload.bin --cmdline "..."`.
   Flash with **`fastboot flash boot_b <img>`** (`fastboot boot` = `remote: 'unknown command'` on this
   device), slot b active.
