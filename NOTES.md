@@ -232,7 +232,8 @@ iOS-related any more; `artifacts/` and `xperia-backup/` are gitignored:
   itself (or at the hardware it touches), with the freeze point moving with timing: after
   `returning error 0` (0156), during pid 21 exec (0157 cpus=4), before pid 23's first marker
   (cpus=1).
-- **0158 result (`/tmp/opencode/log0158.txt` + `.bin`, header `total 120 017`, seq 335, image
+- **0158 result (`artifacts/logs/log0158.txt` + `.bin`, copy of `/tmp/opencode/log0158*`, header
+  `total 120 017`, seq 335, image
   `33aae808...`, booted 15:00:53, ran ~6 min).** The new instruments survived the freeze itself:
   all four busy units printed `alive 109s` in the last second (`hb 108/108 ps 39/39`), so the
   freeze is machine-wide between 109 s and 110 s, not a per-CPU lock. `SWEET STUCK` (176 lines)
